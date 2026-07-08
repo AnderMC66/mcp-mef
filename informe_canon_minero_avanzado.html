@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard Interactivo MEF</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0b1120;
+            --card-bg: #111827;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --accent: #3b82f6;
+            --border: #1f2937;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Outfit', sans-serif; }
+        body { background-color: var(--bg-color); color: var(--text-main); padding: 3rem 2rem; }
+        .header { text-align: center; margin-bottom: 4rem; }
+        .header h1 { font-size: 3rem; font-weight: 800; background: linear-gradient(135deg, #60a5fa, #c084fc, #f472b6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .header p { color: var(--text-muted); margin-top: 1rem; font-size: 1.1rem; }
+        
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 2rem; margin-bottom: 2rem; max-width: 1400px; margin: 0 auto; }
+        .card { background-color: var(--card-bg); border: 1px solid var(--border); border-radius: 16px; padding: 2rem; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1), 0 10px 10px -5px rgba(0,0,0,0.04); transition: transform 0.2s, box-shadow 0.2s; }
+        .card:hover { transform: translateY(-5px); box-shadow: 0 25px 30px -5px rgba(0,0,0,0.2); border-color: rgba(59,130,246,0.3); }
+        .card h2 { font-size: 1.4rem; font-weight: 600; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); color: #e5e7eb; }
+        
+        .chart-container { position: relative; height: 320px; width: 100%; }
+        
+        .table-container { overflow-x: auto; max-width: 1400px; margin: 2rem auto; }
+        table { width: 100%; border-collapse: separate; border-spacing: 0; }
+        th, td { padding: 1.25rem 1rem; text-align: left; border-bottom: 1px solid var(--border); }
+        th { color: var(--text-muted); font-weight: 600; text-transform: uppercase; font-size: 0.85rem; letter-spacing: 0.1em; }
+        tr:hover td { background-color: rgba(255,255,255,0.03); }
+        td { color: #d1d5db; }
+        .amount { font-family: monospace; font-size: 1.2rem; color: #10b981; font-weight: 600; }
+        .rank { width: 40px; color: var(--text-muted); text-align: center; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>Dashboard Interactivo: Canon Minero 2025</h1>
+        <p>Análisis integral basado en más de 32,000 registros descargados de la API de Datos Abiertos del MEF.</p>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <h2>Evolución de la Recaudación (Mes a Mes)</h2>
+            <div class="chart-container">
+                <canvas id="chartMeses"></canvas>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Top 10 Departamentos</h2>
+            <div class="chart-container">
+                <canvas id="chartDeptos"></canvas>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>Distribución por Rubro de Financiamiento</h2>
+            <div class="chart-container">
+                <canvas id="chartRubros"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <div class="table-container">
+        <div class="card">
+            <h2>Top 15 Gobiernos Locales y Regionales</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th class="rank">#</th>
+                        <th>Entidad Ejecutora</th>
+                        <th>Total Recaudado (S/)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td class='rank'>1</td><td>REGION ANCASH SEDE CENTRAL</td><td class='amount'>S/ 829,362,391.20</td></tr><tr><td class='rank'>2</td><td>REGION AREQUIPA-SEDE CENTRAL</td><td class='amount'>S/ 662,274,807.47</td></tr><tr><td class='rank'>3</td><td>REGION CUSCO-SEDE CENTRAL</td><td class='amount'>S/ 581,888,656.28</td></tr><tr><td class='rank'>4</td><td>REGION AYACUCHO-SEDE CENTRAL</td><td class='amount'>S/ 309,990,727.79</td></tr><tr><td class='rank'>5</td><td>REGION CAJAMARCA-SEDE CENTRAL</td><td class='amount'>S/ 278,496,943.57</td></tr><tr><td class='rank'>6</td><td>REGION CAJAMARCA-CUTERVO</td><td class='amount'>S/ 214,801,400.25</td></tr><tr><td class='rank'>7</td><td>REGION AMAZONAS-SEDE CENTRAL</td><td class='amount'>S/ 193,646,659.95</td></tr><tr><td class='rank'>8</td><td>REGION CUSCO-TRANSPORTES</td><td class='amount'>S/ 172,608,814.96</td></tr><tr><td class='rank'>9</td><td>REGION ANCASH-SUBREGION PACIFICO</td><td class='amount'>S/ 141,612,224.67</td></tr><tr><td class='rank'>10</td><td>REGION CAJAMARCA-JAEN</td><td class='amount'>S/ 139,657,136.88</td></tr><tr><td class='rank'>11</td><td>REGION CAJAMARCA-CHOTA</td><td class='amount'>S/ 131,972,624.99</td></tr><tr><td class='rank'>12</td><td>REGION APURIMAC-SEDE CENTRAL</td><td class='amount'>S/ 131,484,291.31</td></tr><tr><td class='rank'>13</td><td>REGION CAJAMARCA-AGRICULTURA</td><td class='amount'>S/ 110,804,046.72</td></tr><tr><td class='rank'>14</td><td>REGION CUSCO -PLAN COPESCO</td><td class='amount'>S/ 90,278,872.01</td></tr><tr><td class='rank'>15</td><td>REGION CUSCO-PROYECTO ESPECIAL PLAN MERISS</td><td class='amount'>S/ 87,901,551.18</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        Chart.defaults.color = '#9ca3af';
+        Chart.defaults.font.family = 'Outfit';
+
+        // Configuración común de tooltips
+        const tooltipConfig = {
+            backgroundColor: 'rgba(17, 24, 39, 0.9)',
+            titleColor: '#fff',
+            bodyColor: '#e5e7eb',
+            borderColor: '#374151',
+            borderWidth: 1,
+            padding: 12,
+            callbacks: {
+                label: function(context) {
+                    let value = context.raw;
+                    return ' S/ ' + value.toLocaleString('en-US', {minimumFractionDigits: 2});
+                }
+            }
+        };
+
+        // Gráfico de Meses
+        new Chart(document.getElementById('chartMeses'), {
+            type: 'line',
+            data: {
+                labels: ["Mes 1", "Mes 2", "Mes 3", "Mes 4", "Mes 5", "Mes 6", "Mes 7", "Mes 8", "Mes 9", "Mes 10", "Mes 11", "Mes 12"],
+                datasets: [{
+                    label: 'Recaudación',
+                    data: [1845080631.47, 494370304.37, 160723603.82, 244624974.4, 228365476.85, 705582555.0, 277974263.36, 223737842.22, 598191834.25, 256965220.46, 247699993.15, 211808677.67],
+                    borderColor: '#3b82f6',
+                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                    borderWidth: 3,
+                    fill: true,
+                    tension: 0.4,
+                    pointBackgroundColor: '#3b82f6',
+                    pointBorderColor: '#fff',
+                    pointRadius: 4,
+                    pointHoverRadius: 6
+                }]
+            },
+            options: { 
+                responsive: true, 
+                maintainAspectRatio: false,
+                plugins: { legend: { display: false }, tooltip: tooltipConfig },
+                scales: {
+                    y: { grid: { color: '#1f2937' }, beginAtZero: true },
+                    x: { grid: { display: false } }
+                }
+            }
+        });
+
+        // Gráfico de Departamentos
+        new Chart(document.getElementById('chartDeptos'), {
+            type: 'bar',
+            data: {
+                labels: ["ANCASH", "CUSCO", "CAJAMARCA", "AREQUIPA", "AYACUCHO", "AMAZONAS", "APURIMAC", "LIMA", "HUANCAVELICA"],
+                datasets: [{
+                    label: 'Recaudación',
+                    data: [1216285338.56, 1137561450.63, 1036448378.75, 924009669.23, 455121979.33, 360876492.53, 353973349.26, 10585308.73, 263410.0],
+                    backgroundColor: '#8b5cf6',
+                    borderRadius: 8,
+                    hoverBackgroundColor: '#a78bfa'
+                }]
+            },
+            options: { 
+                responsive: true, 
+                maintainAspectRatio: false,
+                plugins: { legend: { display: false }, tooltip: tooltipConfig },
+                scales: {
+                    y: { grid: { color: '#1f2937' }, beginAtZero: true },
+                    x: { grid: { display: false } }
+                }
+            }
+        });
+        
+        // Gráfico de Rubros
+        new Chart(document.getElementById('chartRubros'), {
+            type: 'doughnut',
+            data: {
+                labels: ["CANON Y SOBRECANON, REGALIAS, RENTA DE ADUANAS Y PARTICIPACIONES", "FONDO DE COMPENSACION REGIONAL - FONCOR", "DONACIONES Y TRANSFERENCIAS", "RECURSOS POR OPERACIONES OFICIALES DE CREDITO", "RECURSOS DIRECTAMENTE RECAUDADOS"],
+                datasets: [{
+                    data: [2232880563.24, 1876298341.81, 563938469.68, 457738866.63, 364269135.66],
+                    backgroundColor: ['#10b981', '#f59e0b', '#ef4444', '#3b82f6', '#ec4899', '#8b5cf6'],
+                    borderWidth: 2,
+                    borderColor: '#111827',
+                    hoverOffset: 10
+                }]
+            },
+            options: { 
+                responsive: true, 
+                maintainAspectRatio: false, 
+                cutout: '75%',
+                plugins: {
+                    legend: { position: 'right', labels: { padding: 20, usePointStyle: true, pointStyle: 'circle' } },
+                    tooltip: tooltipConfig
+                }
+            }
+        });
+    </script>
+</body>
+</html>

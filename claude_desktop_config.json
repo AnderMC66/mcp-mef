@@ -6,7 +6,7 @@
         "run",
         "--directory",
         "C:\\Users\\Asus\\mcp-mef",
-        "server.py"
+        "main.py"
       ]
     }
   }
