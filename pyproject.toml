@@ -1,10 +1,22 @@
 [project]
 name = "mcp-mef"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "CLI y servidor MCP para los Datos Abiertos del MEF (Perú): descarga, consulta SQL e informes en Markdown/PDF/Excel."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "fpdf2>=2.8.7",
     "httpx>=0.28.1",
+    "jinja2>=3.1.6",
+    "matplotlib>=3.11.1",
     "mcp>=1.28.1",
+    "openpyxl>=3.1.5",
+    "typer>=0.15",
 ]
+
+[project.scripts]
+mef = "mcp_mef.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -3,3 +3,4 @@
 *.db-journal
 .env
 __pycache__/
+output/

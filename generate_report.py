@@ -1,8 +1,10 @@
 import sqlite3
 import json
 
+from mcp_mef.core import DB_PATH
+
 def generar_informe_html():
-    conn = sqlite3.connect('mef_data.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     # Obtener el top 10 departamentos por recaudación
