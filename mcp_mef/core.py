@@ -313,34 +313,50 @@ async def fetch_mef_dataset(resource_id: str, table_name: str, limit: int = 1000
     )
 
 
-async def mef_search_datasets(query: str) -> str:
-    url = f"https://www.datosabiertos.gob.pe/api/3/action/package_search?q={urllib.parse.quote(query)}"
+# El portal datosabiertos.gob.pe (CKAN clásico) que se usaba antes fue dado de baja.
+# El portal propio del MEF (datosabiertos.mef.gob.pe) es hoy una SPA en Angular sin API CKAN
+# pública documentada; estas dos rutas son las que usa internamente su propio frontend
+# (extraídas de su bundle JS: this.main.ws("/PortalWebDatasets/v1.0/getDatasets", ...) y
+# this.main.ws("/PortalWebDatasetDetalle/v1.0/getDatasetDetalle", ...)). No son una API oficial
+# documentada, así que podrían cambiar sin aviso si el MEF actualiza su portal.
+_MEF_SEARCH_URL = "https://datosabiertos.mef.gob.pe/Rest/PortalWebDatasets/v1.0/getDatasets"
+_MEF_DATASET_DETAIL_URL = "https://datosabiertos.mef.gob.pe/Rest/PortalWebDatasetDetalle/v1.0/getDatasetDetalle"
 
+
+async def mef_search_datasets(query: str) -> str:
     try:
-        async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
-            response = await client.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30.0)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            search_payload = {
+                "search": query, "sort": None, "tags": [], "formats": [], "categories": [], "page": 1
+            }
+            response = await client.post(_MEF_SEARCH_URL, json=search_payload)
             if response.status_code != 200:
                 return f"Error HTTP {response.status_code}: {response.text}"
 
-            data = response.json()
-            if data.get("success"):
-                results = data.get("result", {}).get("results", [])
-                out = []
-                for pkg in results[:10]:
-                    resources = pkg.get("resources", [])
-                    for res in resources:
-                        if res.get("format", "").upper() in ["CSV", "JSON", "XLS", "XLSX"]:
-                            out.append({
-                                "titulo_dataset": pkg.get("title"),
-                                "recurso": res.get("name") or res.get("description"),
-                                "formato": res.get("format"),
-                                "resource_id": res.get("id")
-                            })
-                if not out:
-                    return "No se encontraron recursos en formato tabular (CSV, JSON, XLS) para tu búsqueda."
-                return json.dumps(out[:20], indent=2, ensure_ascii=False)
-            else:
-                return "La API de datos abiertos devolvió un error en la búsqueda."
+            datasets = response.json().get("datasets") or []
+            if not datasets:
+                return "No se encontraron datasets para tu búsqueda."
+
+            out = []
+            for ds in datasets[:8]:
+                slug = ds.get("dataset_id")  # slug del dataset (ej. 'canon-minero'), no el resource_id
+                if not slug:
+                    continue
+                detail_resp = await client.post(_MEF_DATASET_DETAIL_URL, json={"dataset": slug})
+                if detail_resp.status_code != 200:
+                    continue
+                for res in detail_resp.json().get("resources", []):
+                    if res.get("resource_format", "").upper() in ["CSV", "JSON", "XLS", "XLSX"]:
+                        out.append({
+                            "titulo_dataset": ds.get("dataset"),
+                            "recurso": res.get("resource_title"),
+                            "formato": res.get("resource_format"),
+                            "resource_id": res.get("resource_id")
+                        })
+
+            if not out:
+                return "Se encontraron datasets pero ninguno con recursos en formato tabular (CSV, JSON, XLS)."
+            return json.dumps(out[:20], indent=2, ensure_ascii=False)
     except Exception as e:
         return f"Excepción al buscar dataset: {str(e)}"
 
