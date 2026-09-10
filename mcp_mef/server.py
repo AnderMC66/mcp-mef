@@ -17,24 +17,34 @@ async def fetch_mef_dataset(
     limit: int = 1000,
     page_size: int = 1000,
     offset: int = 0,
+    append: bool = False,
 ) -> str:
     """
     Descarga un dataset del MEF usando su `resource_id` (obtenido con mef_search_datasets /
-    mef_list_resources) y lo guarda en la base de datos local (SQLite) bajo `table_name`.
-    Si la tabla ya existe, se reemplaza sólo cuando la descarga termina bien.
+    mef_list_resources, o un alias ya registrado) y lo guarda en la base de datos local
+    (SQLite) bajo `table_name`. Por defecto, si la tabla ya existe, se reemplaza (sólo cuando
+    la descarga termina bien).
 
     Pagina automáticamente hasta reunir `limit` registros (o agotar el dataset) en bloques de
     `page_size` (máximo 20000, que es lo más eficiente), insertando cada página según llega.
-    `offset` permite empezar más adelante para traer un dataset grande por tramos.
+
+    Para un dataset de millones de filas (los de Transparencia Económica), tráelo por tramos
+    con `append=True`: cada llamada AGREGA a `table_name` en vez de reemplazarla. Dejando
+    `offset` en 0 (su valor por defecto) con `append=True`, el offset se autodetecta como el
+    nº de filas que la tabla ya tiene, así que repetir exactamente la misma llamada continúa
+    donde se quedó la anterior, hasta que responde "Descarga completa". No uses `append` para
+    la primera llamada de una tabla nueva ni la mezcles con `offset` manual salvo que sepas
+    exactamente qué tramo estás pidiendo.
 
     IMPORTANTE: llama antes a mef_dataset_info(resource_id). Los datasets de Transparencia
     Económica (Presupuesto y Ejecución de Gasto) tienen millones de filas y traerlos enteros
-    puede tardar horas; conviene acordar con el usuario un `limit` razonable.
+    puede tardar horas; conviene acordar con el usuario un `limit` razonable, o iterar con
+    `append=True` avisando del progreso.
 
-    Detecta el tipo de cada columna (INTEGER/REAL/TEXT) a partir de la primera página y
-    registra la descarga en la tabla interna `_meta_downloads` para trazabilidad.
+    Detecta el tipo de cada columna (INTEGER/REAL/TEXT) a partir de cada página y registra la
+    descarga en la tabla interna `_meta_downloads` para trazabilidad.
     """
-    return await core.fetch_mef_dataset(resource_id, table_name, limit, page_size, offset)
+    return await core.fetch_mef_dataset(resource_id, table_name, limit, page_size, offset, append=append)
 
 
 @mcp.tool()

@@ -131,9 +131,23 @@ def fetch(
     page_size: int = typer.Option(
         1000, "--page-size", help=f"Filas por petición (máx. {core.MAX_PAGE_SIZE}; más grande = más rápido)."
     ),
-    offset: int = typer.Option(0, "--offset", help="Fila desde la que empezar, para traer un dataset por tramos."),
+    offset: int = typer.Option(
+        0, "--offset", help="Fila desde la que empezar. Con --append y 0, se autodetecta."
+    ),
+    append: bool = typer.Option(
+        False, "--append",
+        help="Agrega a table_name en vez de reemplazarla: repite el comando para traer el dataset completo por tramos.",
+    ),
 ):
-    """Descarga un dataset del MEF y lo guarda como tabla SQLite local."""
+    """Descarga un dataset del MEF y lo guarda como tabla SQLite local.
+
+    Para un dataset de millones de filas, usa --append y repite el mismo comando: cada
+    llamada continúa exactamente donde se quedó la anterior, hasta agotar el dataset.
+
+        mef fetch <resource_id> gasto_2026 --append --limit 500000
+        mef fetch <resource_id> gasto_2026 --append --limit 500000   # continúa solo
+        ...  # repetir hasta que diga "Descarga completa"
+    """
     with Progress(
         SpinnerColumn(),
         TextColumn("[cyan]Descargando[/cyan]"),
@@ -146,14 +160,21 @@ def fetch(
         # total=None deja la barra en modo indeterminado hasta que la API informa el total.
         tarea = barra.add_task("fetch", total=None)
 
+        # Con --append y offset=0, el punto de partida real lo decide fetch_mef_dataset
+        # (autodetectado a partir de las filas que la tabla ya tiene), no el offset=0 de acá:
+        # en ese caso el techo de la barra sólo puede acotarse por --limit.
+        autoresume = append and offset == 0
+
         def _avance(descargadas: int, total: int | None) -> None:
-            # El total de la barra es lo que se va a traer de verdad: el mínimo entre lo que
-            # queda del dataset y el limit pedido.
-            pendiente = max(min(total, offset + limit) - offset, 0) if total else None
-            barra.update(tarea, completed=descargadas, total=pendiente or None)
+            techo = limit
+            if total is not None and not autoresume:
+                techo = max(min(total, offset + limit) - offset, 0)
+            barra.update(tarea, completed=descargadas, total=techo or None)
 
         resultado = asyncio.run(
-            core.fetch_mef_dataset(resource_id, table_name, limit, page_size, offset, progress=_avance)
+            core.fetch_mef_dataset(
+                resource_id, table_name, limit, page_size, offset, progress=_avance, append=append
+            )
         )
     _emit(resultado)
 
