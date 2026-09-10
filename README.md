@@ -14,10 +14,12 @@ Los datos (`mef_data.db`) y los informes generados (`output/`) se guardan en `~/
 - **Búsqueda Integrada:** Busca conjuntos de datos por palabra clave (ej. "gasto", "inversiones") y lista sus recursos año por año.
 - **Transparencia Económica:** llega a los datos de la Consulta Amigable (Presupuesto y Ejecución de Gasto e Ingreso, año por año) a través de la API de Datos Abiertos — ver [Transparencia Económica](#transparencia-económica-consulta-amigable).
 - **Descarga por streaming:** pagina la API e inserta cada página en SQLite según llega, así que la memoria no crece con el tamaño del dataset (los de gasto anual pasan de 7 millones de filas). Detecta el tipo de cada columna (INTEGER/REAL/TEXT) y conserva los ceros a la izquierda de ubigeos y códigos.
+- **A prueba de tablas enormes:** las consultas devuelven como mucho 1000 filas (y avisan si hay más), las exportaciones a CSV/Excel se escriben por lotes con memoria constante, y los gráficos rechazan consultas con más de 2000 puntos en vez de colgarse.
 - **Dimensiona antes de bajar:** `mef info <resource_id>` dice cuántas filas y columnas tiene un recurso sin descargarlo.
 - **Motor SQL Integrado:** Los datos se guardan en una base de datos `mef_data.db` (SQLite) para que el LLM pueda hacer joins, agrupaciones y análisis complejos.
 - **Trazabilidad:** Cada descarga queda registrada (tabla, `resource_id`, fecha, nº de filas) para que los informes puedan citar su fuente automáticamente.
-- **Catálogo de datasets:** Guarda alias memorables hacia `resource_id` ya verificados, para no tener que rebuscar en el portal cada vez.
+- **Catálogo de datasets:** Guarda alias memorables hacia `resource_id` ya verificados; a partir de ahí `mef fetch` y `mef info` aceptan el alias donde esperan el `resource_id`.
+- **Mantenimiento:** `mef paths` dice cuánto ocupa la base y `mef drop <tabla> --vacuum` borra un dataset y devuelve el espacio al disco (un año de gasto son varios GB).
 - **Resumen exploratorio (EDA):** Nº de filas, nulos, valores distintos y estadísticas (min/max/promedio) de cualquier tabla descargada.
 - **Informes en Markdown, PDF, HTML y Excel:** Cualquier consulta SQL se puede convertir en un informe (tabla + título + fecha + fuente) sin scripts externos.
 - **Gráficos:** vía QuickChart (URL online) o generados localmente con matplotlib (PNG, sin depender de internet, ideal para incrustar en PDFs).
@@ -91,8 +93,10 @@ mef export excel "SELECT ..." --filename mi_reporte          # exportar a Excel
 mef export csv "SELECT ..." mi_reporte.csv                   # exportar a CSV
 mef chart-local "SELECT ..." bar "Mi gráfico"                # PNG local con matplotlib
 mef alias add gasto_2026 <resource_id> -d "Gasto mensual 2026"
-mef alias list
-mef paths                                                    # dónde viven la base y las salidas
+mef alias list                                               # y `mef alias remove <alias>`
+mef fetch gasto_2026 otra_tabla                              # los alias valen como resource_id
+mef paths                                                    # rutas, tamaño de la base y nº de filas
+mef drop gasto_2026 --vacuum                                 # borra una tabla y recupera el espacio
 mef mcp                                                      # arranca el servidor MCP por stdio
 ```
 
@@ -137,6 +141,26 @@ Cosas a tener en cuenta, comprobadas contra la API:
 - **Diccionario de variables.** Cada dataset trae un recurso `*_Diccionario.csv` (63 filas)
   que explica qué es cada columna; descárgalo a una tabla aparte y consúltalo con SQL.
 
+### Trabajar con tablas de millones de filas
+
+Una vez descargados, los datos son una tabla SQLite normal, pero conviene saber qué hace la
+herramienta para no ahogarse (medido sobre una tabla de 1 000 000 de filas):
+
+| Operación | Comportamiento |
+|---|---|
+| `mef sql` / `sql_mef_db` | Devuelve 1000 filas como máximo y avisa si hay más (`--limit 0` quita el tope). Un `SELECT *` sin tope tardaba 113 s y 1,6 GB de RAM; con el tope son 0,1 s. |
+| `mef export csv` | Sin tope: escribe por lotes, con memoria plana (24 MB para un millón de filas). |
+| `mef export excel` | Corta en 1 048 575 filas, que es el límite del formato `.xlsx`, y lo avisa. |
+| `mef report` | Vuelca `--max-rows` filas (5000 por defecto) y el pie indica si había más. |
+| `mef chart` / `chart-local` | Rechaza consultas con más de 2000 puntos: agrupa antes con `GROUP BY`. |
+| `mef summary` | Calcula todas las estadísticas en una sola pasada por la tabla. |
+
+Agregar en SQL siempre es más rápido que traerse las filas: un `GROUP BY` sobre un millón de
+filas tarda ~1 s, así que no hacen falta índices.
+
+Cuando termines con un año de datos, `mef drop gasto_2009 --vacuum` lo borra y devuelve los GB
+al disco; `mef paths` te dice cuánto está ocupando la base en cada momento.
+
 ## Herramientas (Tools) Expuestas al LLM vía MCP
 
 El servidor MCP expone las siguientes herramientas (equivalentes 1 a 1 a los subcomandos de `mef`). Todos los archivos que generan (CSV, Excel, PDF, Markdown, HTML, PNG) se guardan en `~/.mcp-mef/output/`.
@@ -147,12 +171,16 @@ El servidor MCP expone las siguientes herramientas (equivalentes 1 a 1 a los sub
 * `mef_dataset_info(resource_id)`: Cuántas filas y columnas tiene un recurso, con una fila de muestra, **sin descargarlo**. Conviene llamarlo antes de cualquier `fetch_mef_dataset`.
 * `fetch_mef_dataset(resource_id, table_name, limit, page_size, offset)`: Descarga un recurso del portal paginando hasta `limit` registros e insertando cada página en SQLite según llega (memoria constante). La tabla anterior se reemplaza sólo si la descarga termina bien.
 * `mef_register_dataset_alias(alias, resource_id, description)`: Guarda un alias memorable hacia un `resource_id` ya verificado.
-* `mef_list_known_datasets()`: Lista los datasets registrados previamente con `mef_register_dataset_alias`.
+* `mef_list_known_datasets()` / `mef_remove_dataset_alias(alias)`: Lista o borra los alias registrados.
 
 **Consulta y exploración**
-* `sql_mef_db(query)`: Ejecuta comandos SQL sobre la base de datos local y retorna los resultados en JSON estructurado. Es la única tool que admite escrituras; las de informe, gráfico y exportación sólo aceptan `SELECT`/`WITH`, y el propio motor SQLite lo impone.
+* `sql_mef_db(query, max_rows)`: Ejecuta comandos SQL sobre la base de datos local y retorna los resultados en JSON estructurado, con un tope de 1000 filas por defecto y un aviso `truncado` cuando hay más. Es la única tool que admite escrituras; las de informe, gráfico y exportación sólo aceptan `SELECT`/`WITH`, y el propio motor SQLite lo impone.
 * `mef_get_schema()`: Lista las tablas disponibles, sus columnas, nº de filas y metadata de descarga.
 * `mef_dataset_summary(table_name)`: Resumen exploratorio (EDA) de una tabla: nulos, valores distintos, min/max/promedio por columna.
+
+**Mantenimiento**
+* `mef_db_stats()`: Tamaño de la base local en disco, tablas y nº de filas de cada una.
+* `mef_drop_table(table_name, vacuum)`: Borra una tabla descargada y su trazabilidad; con `vacuum` compacta el archivo. Destructivo: conviene confirmarlo con la persona usuaria.
 
 **Informes y exportación**
 * `mef_generate_report(query, title, formats, filename_base, max_rows)`: Genera un informe (tabla + título + fecha + fuente) en `markdown`, `pdf` y/o `html` a partir de cualquier consulta de lectura. La tabla se trunca a `max_rows` filas (5000 por defecto) y el pie indica el total real.
@@ -176,7 +204,7 @@ Para cualquier otra tabla o consulta, usa `mef report` (CLI) o la tool `mef_gene
 
 ```bash
 uv sync --group dev     # instala dependencias + pytest
-uv run pytest -q        # 77 tests, sin tocar la red ni ~/.mcp-mef
+uv run pytest -q        # 108 tests, sin tocar la red ni ~/.mcp-mef
 ```
 
 Los tests usan un `MCP_MEF_HOME` temporal y un transporte HTTP simulado, así que no descargan

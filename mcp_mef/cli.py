@@ -118,14 +118,14 @@ def resources(
 
 
 @app.command("info", rich_help_panel="Búsqueda y Descarga")
-def info(resource_id: str = typer.Argument(..., help="resource_id a inspeccionar.")):
+def info(resource_id: str = typer.Argument(..., help="resource_id (o alias) a inspeccionar.")):
     """Cuántas filas y columnas tiene un recurso, sin descargarlo."""
     _emit(asyncio.run(core.mef_dataset_info(resource_id)))
 
 
 @app.command("fetch", rich_help_panel="Búsqueda y Descarga")
 def fetch(
-    resource_id: str = typer.Argument(..., help="resource_id del dataset en datosabiertos.mef.gob.pe."),
+    resource_id: str = typer.Argument(..., help="resource_id del recurso, o un alias registrado."),
     table_name: str = typer.Argument(..., help="Nombre de la tabla local donde guardarlo."),
     limit: int = typer.Option(1000, "--limit", "-l", help="Total de registros a traer (pagina automáticamente)."),
     page_size: int = typer.Option(
@@ -162,10 +162,12 @@ def fetch(
 def sql(
     query: str = typer.Argument(..., help="Consulta SQL a ejecutar sobre mef_data.db."),
     as_json: bool = typer.Option(False, "--json", help="Devuelve JSON crudo, útil para encadenar con jq."),
-    limit: int = typer.Option(50, "--limit", "-n", help="Filas a mostrar en la tabla (0 = todas)."),
+    limit: int = typer.Option(
+        core.MAX_SQL_ROWS, "--limit", "-n", help="Filas a traer (0 = todas; ojo con tablas de millones)."
+    ),
 ):
     """Ejecuta SQL nativo sobre la base local y muestra el resultado como tabla (o JSON con --json)."""
-    raw = core.sql_mef_db(query)
+    raw = core.sql_mef_db(query, limit)
     if as_json:
         console.print(raw, markup=False, highlight=False, soft_wrap=True)
         raise typer.Exit(code=1 if '"status": "error"' in raw else 0)
@@ -179,15 +181,14 @@ def sql(
         return
 
     rows = payload["filas"]
-    shown = rows[:limit] if limit > 0 else rows
     table = Table(box=box.SIMPLE_HEAVY, header_style="bold cyan")
     for col in payload["columnas"]:
         table.add_column(str(col), overflow="fold")
-    for row in shown:
+    for row in rows:
         table.add_row(*["" if v is None else str(v) for v in row])
     console.print(table)
-    suffix = f" (mostrando {len(shown)}; usa --limit 0 para todas)" if len(shown) < len(rows) else ""
-    console.print(f"[dim]{len(rows)} fila(s){suffix}[/dim]")
+    suffix = " [yellow](hay más filas: usa --limit 0, GROUP BY o export)[/yellow]" if payload.get("truncado") else ""
+    console.print(f"[dim]{len(rows)} fila(s)[/dim]{suffix}")
 
 
 @app.command("schema", rich_help_panel="Consulta y Exploración")
@@ -248,6 +249,12 @@ def alias_add(
     _emit(core.mef_register_dataset_alias(alias, resource_id, description))
 
 
+@alias_app.command("remove")
+def alias_remove(alias: str = typer.Argument(..., help="Alias a borrar del catálogo.")):
+    """Borra un alias registrado."""
+    _emit(core.mef_remove_dataset_alias(alias))
+
+
 @alias_app.command("list")
 def alias_list():
     """Lista los datasets registrados previamente."""
@@ -274,14 +281,28 @@ def export_excel(
 
 @app.command("paths", rich_help_panel="Consulta y Exploración")
 def paths():
-    """Muestra dónde viven la base de datos y los archivos generados."""
+    """Muestra dónde viven la base y las salidas, y cuánto ocupan."""
+    stats = json.loads(core.mef_db_stats())
     table = Table(show_header=False, box=box.SIMPLE)
     table.add_column(style="bold cyan", no_wrap=True)
     table.add_column(overflow="fold")
-    table.add_row("Base de datos", core.DB_PATH)
+    table.add_row("Base de datos", f"{core.DB_PATH}  [dim]({stats['tamano']})[/dim]")
     table.add_row("Salidas", core.OUTPUT_DIR)
+    table.add_row("Tablas", f"{len(stats['tablas'])} ({stats['filas_totales']:,} filas)")
     table.add_row("Configurable con", "MCP_MEF_HOME")
     console.print(table)
+
+
+@app.command("drop", rich_help_panel="Consulta y Exploración")
+def drop(
+    table_name: str = typer.Argument(..., help="Tabla a borrar."),
+    vacuum: bool = typer.Option(False, "--vacuum", help="Compacta la base para recuperar el espacio."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="No pedir confirmación."),
+):
+    """Borra una tabla descargada (destructivo)."""
+    if not yes:
+        typer.confirm(f"¿Borrar la tabla '{table_name}'? Volver a descargarla puede tardar", abort=True)
+    _emit(core.mef_drop_table(table_name, vacuum))
 
 
 @app.command("mcp", rich_help_panel="Búsqueda y Descarga")

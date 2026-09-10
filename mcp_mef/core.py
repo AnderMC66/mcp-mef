@@ -5,6 +5,7 @@ como @mcp.tool() y cli.py las expone como subcomandos de terminal.
 """
 import asyncio
 import csv
+import itertools
 import json
 import os
 import re
@@ -23,7 +24,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 from fpdf import FPDF  # noqa: E402
 from jinja2 import Template  # noqa: E402
 from openpyxl import Workbook  # noqa: E402
+from openpyxl.cell import WriteOnlyCell  # noqa: E402
 from openpyxl.styles import Font  # noqa: E402
+from openpyxl.utils import get_column_letter  # noqa: E402
 
 # Directorio de datos del usuario: fijo, independiente de dónde viva el código instalado.
 # Así el CLI global ("mef ...") y el servidor MCP para Claude Desktop comparten la misma base
@@ -63,6 +66,20 @@ MAX_PAGE_SIZE = 20000
 STAGING_PREFIX = "_meta_stg_"
 
 CHART_TYPES = ("bar", "pie", "line")
+
+# Tope de filas que sql_mef_db devuelve por defecto. Medido sobre una tabla de 1 millón de
+# filas: un `SELECT *` sin tope tardaba 113 s, ocupaba 1,6 GB de RAM y producía 362 MB de
+# JSON — suficiente para tumbar la sesión del cliente MCP. Con fetchmany son 10 ms.
+MAX_SQL_ROWS = 1000
+
+# Un gráfico con más puntos que esto es ilegible, y matplotlib tarda minutos en dibujarlo.
+MAX_CHART_POINTS = 2000
+
+# Límite duro del formato .xlsx (1 048 576 filas contando la cabecera).
+EXCEL_MAX_ROWS = 1_048_575
+
+# Filas por lote al exportar: mantiene la memoria plana sin penalizar la velocidad.
+STREAM_BATCH = 10000
 
 # Acciones que el authorizer de SQLite permite en las rutas de sólo lectura (informes,
 # gráficos, exportaciones). Cualquier otra (INSERT, UPDATE, DELETE, DROP, ATTACH...) la
@@ -138,18 +155,50 @@ def _is_read_query(query: str) -> bool:
     return bool(re.match(r'(?i)(select|with|values)\b', stripped))
 
 
-def _run_read_query(query: str) -> tuple[list[str], list[tuple], dict | None]:
+def _run_read_query(
+    query: str, max_rows: int | None = None
+) -> tuple[list[str], list[tuple], bool, dict | None]:
     """Ejecuta una consulta de lectura sobre la base local.
 
-    Devuelve (columnas, filas, info_de_fuente). El authorizer de SQLite garantiza que la
-    consulta no pueda escribir aunque el texto parezca inofensivo.
+    Devuelve (columnas, filas, hubo_truncado, info_de_fuente). Con `max_rows` pide una fila
+    de más para saber si había continuación, sin materializar el resto: sobre tablas de
+    millones de filas la diferencia con fetchall() es de milisegundos frente a minutos.
+    El authorizer de SQLite garantiza que la consulta no pueda escribir aunque el texto
+    parezca inofensivo.
     """
     with _db(read_only=True) as conn:
         cursor = conn.cursor()
         cursor.execute(query)
-        rows = cursor.fetchall()
         columns = [d[0] for d in cursor.description] if cursor.description else []
-    return columns, rows, _lookup_source_info(query)
+        if max_rows is None:
+            rows, truncated = cursor.fetchall(), False
+        else:
+            rows = cursor.fetchmany(max_rows + 1)
+            truncated = len(rows) > max_rows
+            rows = rows[:max_rows]
+    return columns, rows, truncated, _lookup_source_info(query)
+
+
+@contextmanager
+def _stream_read_query(query: str, batch_size: int = STREAM_BATCH):
+    """Recorre una consulta de lectura por lotes, sin cargarla entera en memoria.
+
+    Cede (columnas, generador_de_filas). Exportar un millón de filas con fetchall() pedía
+    1,2 GB de RAM; por lotes la memoria se mantiene plana.
+    """
+    with _db(read_only=True) as conn:
+        cursor = conn.cursor()
+        cursor.execute(query)
+        columns = [d[0] for d in cursor.description] if cursor.description else []
+
+        def _rows():
+            while True:
+                lote = cursor.fetchmany(batch_size)
+                if not lote:
+                    return
+                yield from lote
+
+        yield columns, _rows()
 
 
 def _infer_sql_type(values: list[str]) -> str:
@@ -233,6 +282,32 @@ def _register_download(cursor: sqlite3.Cursor, table_name: str, resource_id: str
     ''', (table_name, resource_id, source_url, datetime.now().isoformat(timespec="seconds"), row_count))
 
 
+def _resolve_resource_id(value: str) -> str:
+    """Traduce un alias del catálogo a su resource_id; si no lo es, lo devuelve tal cual.
+
+    Así `mef fetch gasto_2026 tabla` funciona igual que con el UUID, que es lo que hacía útil
+    registrar alias en primer lugar.
+    """
+    candidato = str(value).strip()
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT resource_id FROM _meta_catalog WHERE alias = ?", (candidato,)
+            ).fetchone()
+    except sqlite3.Error:
+        return candidato
+    return row[0] if row else candidato
+
+
+def _user_tables(conn: sqlite3.Connection) -> list[str]:
+    """Tablas de datos, dejando fuera las internas (_meta*) y las del propio SQLite."""
+    filas = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE '\\_meta%' ESCAPE '\\' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).fetchall()
+    return [f[0] for f in filas]
+
+
 def _lookup_source_info(query: str) -> dict | None:
     match = re.search(r'FROM\s+"?([A-Za-z_][A-Za-z0-9_]*)"?', query, re.IGNORECASE)
     if not match:
@@ -251,18 +326,32 @@ def _lookup_source_info(query: str) -> dict | None:
     return None
 
 
+def _human_size(nbytes: float) -> str:
+    """Tamaño legible: una base recién creada no debe leerse como '0.0 MB'."""
+    for unidad in ("B", "KB", "MB"):
+        if abs(nbytes) < 1024:
+            return f"{nbytes:.0f} {unidad}" if unidad != "MB" else f"{nbytes:.1f} MB"
+        nbytes /= 1024
+    return f"{nbytes:.2f} GB"
+
+
 def _safe_pdf_text(s) -> str:
     # Las fuentes core de fpdf2 (Helvetica) sólo soportan latin-1.
     return str(s).encode('latin-1', 'replace').decode('latin-1')
 
 
-def _truncate_note(total: int, shown: int) -> str:
-    if shown >= total:
-        return ""
-    return f" (se muestran las primeras {shown} de {total}; usa LIMIT o sube max_rows)"
+def _rows_footer(shown: int, truncated: bool) -> str:
+    """Pie de un informe.
+
+    Cuando la consulta se cortó en `max_rows` no se conoce el total real (contarlo obligaría
+    a recorrer la tabla entera), así que se dice lo que sí se sabe en vez de inventar cifras.
+    """
+    if not truncated:
+        return f"Total de filas: {shown}"
+    return f"Filas mostradas: {shown} (la consulta devuelve más; usa LIMIT o sube max_rows)"
 
 
-def _build_markdown_report(title, columns, rows, generated_at, source_info, total_rows) -> str:
+def _build_markdown_report(title, columns, rows, generated_at, source_info, truncated) -> str:
     lines = [f"# {title}", "", f"*Generado: {generated_at}*"]
     if source_info:
         lines.append(
@@ -277,7 +366,7 @@ def _build_markdown_report(title, columns, rows, generated_at, source_info, tota
         cells = ["" if v is None else str(v).replace("|", "\\|").replace("\n", " ") for v in r]
         lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
-    lines.append(f"_Total de filas: {total_rows}{_truncate_note(total_rows, len(rows))}_")
+    lines.append(f"_{_rows_footer(len(rows), truncated)}_")
     return "\n".join(lines)
 
 
@@ -317,26 +406,25 @@ _HTML_REPORT_TEMPLATE = Template("""<!DOCTYPE html>
       </tbody>
     </table>
   </div>
-  <div class="footer">Total de filas: {{ total_rows }}{{ truncate_note }} &middot; Generado automáticamente por MCP-MEF</div>
+  <div class="footer">{{ footer }} &middot; Generado automáticamente por MCP-MEF</div>
 </div>
 </body>
 </html>
 """)
 
 
-def _build_html_report(title, columns, rows, generated_at, source_info, total_rows) -> str:
+def _build_html_report(title, columns, rows, generated_at, source_info, truncated) -> str:
     return _HTML_REPORT_TEMPLATE.render(
         title=title,
         columns=columns,
         rows=rows,
         generated_at=generated_at,
         source_info=source_info,
-        total_rows=total_rows,
-        truncate_note=_truncate_note(total_rows, len(rows)),
+        footer=_rows_footer(len(rows), truncated),
     )
 
 
-def _build_pdf_report(title, columns, rows, generated_at, source_info, path, total_rows) -> None:
+def _build_pdf_report(title, columns, rows, generated_at, source_info, path, truncated) -> None:
     # Con muchas columnas la tabla no cabe en vertical; el apaisado evita el desbordamiento.
     pdf = FPDF(orientation="L" if len(columns) > 6 else "P")
     pdf.add_page()
@@ -364,7 +452,7 @@ def _build_pdf_report(title, columns, rows, generated_at, source_info, path, tot
     pdf.ln(4)
     pdf.cell(
         0, 6,
-        _safe_pdf_text(f"Total de filas: {total_rows}{_truncate_note(total_rows, len(rows))}"),
+        _safe_pdf_text(_rows_footer(len(rows), truncated)),
         new_x="LMARGIN", new_y="NEXT",
     )
     pdf.output(path)
@@ -380,7 +468,7 @@ def _chart_series(query: str) -> tuple[list[str], list[float], str] | str:
     if not _is_read_query(query):
         return "Error: solo se aceptan consultas de lectura (SELECT / WITH)."
     try:
-        columns, rows, _ = _run_read_query(query)
+        columns, rows, truncated, _ = _run_read_query(query, MAX_CHART_POINTS)
     except sqlite3.Error as e:
         return f"Error al ejecutar la consulta: {e}"
 
@@ -388,6 +476,11 @@ def _chart_series(query: str) -> tuple[list[str], list[float], str] | str:
         return "La consulta no retornó datos."
     if len(columns) < 2:
         return "La consulta SQL debe retornar 2 columnas: etiqueta y valor numérico."
+    if truncated:
+        return (
+            f"La consulta devuelve más de {MAX_CHART_POINTS} puntos: un gráfico así es "
+            "ilegible. Agrupa con GROUP BY o recorta con LIMIT."
+        )
 
     labels, values, omitidas = [], [], 0
     for label, value in ((r[0], r[1]) for r in rows):
@@ -444,8 +537,9 @@ async def mef_dataset_info(resource_id: str) -> str:
 
     Conviene llamarla antes de cualquier fetch: los datasets de Transparencia Económica
     (Consulta Amigable) pasan de 7 millones de filas y 63 columnas, y bajarlos a ciegas
-    puede tardar horas.
+    puede tardar horas. Acepta también un alias registrado en el catálogo.
     """
+    resource_id = _resolve_resource_id(resource_id)
     try:
         async with httpx.AsyncClient(
             timeout=HTTP_TIMEOUT,
@@ -489,6 +583,7 @@ async def fetch_mef_dataset(
     Cada página se inserta y se confirma en cuanto llega, sobre una tabla de staging: así la
     memoria no crece con el tamaño del dataset (los de Gasto pasan de 7 millones de filas) y
     la tabla anterior sigue intacta y consultable hasta que la descarga termina bien.
+    `resource_id` puede ser el UUID del recurso o un alias registrado en el catálogo.
     `progress`, si se pasa, se llama con (filas_descargadas, filas_totales_o_None).
     """
     try:
@@ -500,6 +595,9 @@ async def fetch_mef_dataset(
         return "Error: 'limit' y 'page_size' deben ser mayores que cero."
     if offset < 0:
         return "Error: 'offset' no puede ser negativo."
+
+    # Admite tanto el resource_id como un alias ya registrado con mef_register_dataset_alias.
+    resource_id = _resolve_resource_id(resource_id)
     page_size = min(page_size, MAX_PAGE_SIZE)
 
     quoted = _quote_ident(table_name)
@@ -799,6 +897,26 @@ def mef_register_dataset_alias(alias: str, resource_id: str, description: str = 
     return f"Alias '{alias}' registrado -> resource_id '{resource_id}'."
 
 
+def mef_remove_dataset_alias(alias: str) -> str:
+    """Borra un alias del catálogo (no toca las tablas ya descargadas)."""
+    nombre = alias.strip()
+    if not nombre:
+        return "Error: indica el alias a borrar."
+    try:
+        with _db() as conn:
+            cursor = conn.execute("DELETE FROM _meta_catalog WHERE alias = ?", (nombre,))
+            conn.commit()
+            borrados = cursor.rowcount
+    except sqlite3.OperationalError:
+        return "Aún no hay ningún alias registrado."
+    except sqlite3.Error as e:
+        return f"Error al borrar el alias: {e}"
+
+    if not borrados:
+        return f"No había ningún alias llamado '{nombre}'."
+    return f"Alias '{nombre}' borrado."
+
+
 def mef_list_known_datasets() -> str:
     try:
         with _db() as conn:
@@ -823,7 +941,8 @@ def mef_list_known_datasets() -> str:
     return json.dumps(catalog, indent=2, ensure_ascii=False)
 
 
-def sql_mef_db(query: str) -> str:
+def sql_mef_db(query: str, max_rows: int = MAX_SQL_ROWS) -> str:
+    """Ejecuta SQL sobre la base local. `max_rows=0` quita el tope (úsalo con cuidado)."""
     try:
         with _db() as conn:
             cursor = conn.cursor()
@@ -831,11 +950,21 @@ def sql_mef_db(query: str) -> str:
             # `cursor.description` es la señal fiable de si la consulta devolvió filas:
             # cubre CTEs (`WITH ... SELECT`) y PRAGMA, que un startswith('SELECT') no ve.
             if cursor.description is not None:
-                results = cursor.fetchall()
                 columns = [desc[0] for desc in cursor.description]
-                return json.dumps(
-                    {"columnas": columns, "filas": results}, indent=2, ensure_ascii=False, default=str
-                )
+                if max_rows > 0:
+                    results = cursor.fetchmany(max_rows + 1)
+                    truncado = len(results) > max_rows
+                    results = results[:max_rows]
+                else:
+                    results, truncado = cursor.fetchall(), False
+                payload = {"columnas": columns, "filas": results}
+                if truncado:
+                    payload["truncado"] = True
+                    payload["nota"] = (
+                        f"Se devuelven las primeras {max_rows} filas. Agrega LIMIT, agrupa con "
+                        "GROUP BY o sube max_rows si de verdad necesitas más."
+                    )
+                return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
             conn.commit()
             return json.dumps({
                 "status": "success",
@@ -850,11 +979,7 @@ def mef_get_schema() -> str:
     try:
         with _db() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE '\\_meta%' ESCAPE '\\' AND name NOT LIKE 'sqlite_%'"
-            )
-            tables = [row[0] for row in cursor.fetchall()]
+            tables = _user_tables(conn)
 
             schema = {}
             for table in tables:
@@ -886,6 +1011,75 @@ def mef_get_schema() -> str:
         return f"Error al obtener el esquema: {e}"
 
 
+def mef_db_stats() -> str:
+    """Tamaño de la base en disco y qué ocupa cada tabla descargada."""
+    try:
+        tamano = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+        with _db() as conn:
+            tablas = {
+                nombre: conn.execute(f'SELECT COUNT(*) FROM {_quote_ident(nombre)}').fetchone()[0]
+                for nombre in _user_tables(conn)
+            }
+    except sqlite3.Error as e:
+        return f"Error al leer la base: {e}"
+
+    return json.dumps(
+        {
+            "base_de_datos": DB_PATH,
+            "tamano": _human_size(tamano),
+            "tamano_mb": round(tamano / 1e6, 2),
+            "salidas": OUTPUT_DIR,
+            "tablas": tablas,
+            "filas_totales": sum(tablas.values()),
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+def mef_drop_table(table_name: str, vacuum: bool = False) -> str:
+    """Borra una tabla descargada y su registro de trazabilidad.
+
+    Con `vacuum=True` además compacta el archivo: SQLite no devuelve el espacio al sistema
+    al borrar una tabla, así que sin esto la base sigue ocupando los GB de un dataset grande.
+    """
+    try:
+        _validate_table_name(table_name)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    try:
+        with _db() as conn:
+            existe = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (table_name,)
+            ).fetchone()
+            if not existe:
+                return f"La tabla '{table_name}' no existe."
+
+            filas = conn.execute(f'SELECT COUNT(*) FROM {_quote_ident(table_name)}').fetchone()[0]
+            antes = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+
+            conn.execute(f'DROP TABLE {_quote_ident(table_name)}')
+            try:
+                conn.execute("DELETE FROM _meta_downloads WHERE table_name = ?", (table_name,))
+            except sqlite3.OperationalError:
+                pass  # nunca se registró una descarga para esta tabla
+            conn.commit()
+
+            if vacuum:
+                # VACUUM no puede correr dentro de una transacción.
+                conn.isolation_level = None
+                conn.execute("VACUUM")
+    except sqlite3.Error as e:
+        return f"Error al borrar la tabla: {e}"
+
+    despues = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    detalle = f" La base pasó de {_human_size(antes)} a {_human_size(despues)}." if vacuum else (
+        " El archivo no se encoge hasta que compactes con vacuum=True."
+    )
+    return f"Tabla '{table_name}' borrada ({filas} filas).{detalle}"
+
+
 def mef_dataset_summary(table_name: str) -> str:
     try:
         _validate_table_name(table_name)
@@ -904,30 +1098,34 @@ def mef_dataset_summary(table_name: str) -> str:
             cursor.execute(f'SELECT COUNT(*) FROM {quoted}')
             total = cursor.fetchone()[0]
 
-            summary = {"tabla": table_name, "total_filas": total, "columnas": {}}
+            # Todas las estadísticas en UNA sola pasada por la tabla. Una consulta por
+            # columna recorría el archivo tantas veces como columnas: sobre un millón de
+            # filas y 20 columnas eran 18,5 s frente a 9,7 s así.
+            piezas: list[str] = []
+            plan: list[tuple[str, str, bool]] = []
             for col in cols:
                 name, ctype = col[1], col[2]
                 qcol = _quote_ident(name)
+                numerica = ctype in ("INTEGER", "REAL")
+                piezas.append(f'SUM({qcol} IS NULL)')
+                piezas.append(f'COUNT(DISTINCT {qcol})')
+                if numerica:
+                    piezas += [f'MIN({qcol})', f'MAX({qcol})', f'AVG({qcol})']
+                plan.append((name, ctype, numerica))
+
+            cursor.execute(f'SELECT {", ".join(piezas)} FROM {quoted}')
+            valores = list(cursor.fetchone())
+
+            summary = {"tabla": table_name, "total_filas": total, "columnas": {}}
+            for name, ctype, numerica in plan:
                 col_info: dict = {"tipo": ctype}
-                # Una sola pasada por columna en vez de dos o tres consultas independientes.
-                if ctype in ("INTEGER", "REAL"):
-                    cursor.execute(
-                        f'SELECT SUM({qcol} IS NULL), COUNT(DISTINCT {qcol}), '
-                        f'MIN({qcol}), MAX({qcol}), AVG({qcol}) FROM {quoted}'
-                    )
-                    nulos, distintos, mn, mx, avg = cursor.fetchone()
-                    col_info["nulos"] = nulos or 0
-                    col_info["valores_distintos"] = distintos
-                    col_info["min"] = mn
-                    col_info["max"] = mx
+                col_info["nulos"] = valores.pop(0) or 0
+                col_info["valores_distintos"] = valores.pop(0)
+                if numerica:
+                    col_info["min"] = valores.pop(0)
+                    col_info["max"] = valores.pop(0)
+                    avg = valores.pop(0)
                     col_info["promedio"] = round(avg, 2) if avg is not None else None
-                else:
-                    cursor.execute(
-                        f'SELECT SUM({qcol} IS NULL), COUNT(DISTINCT {qcol}) FROM {quoted}'
-                    )
-                    nulos, distintos = cursor.fetchone()
-                    col_info["nulos"] = nulos or 0
-                    col_info["valores_distintos"] = distintos
                 summary["columnas"][name] = col_info
 
         return json.dumps(summary, indent=2, ensure_ascii=False)
@@ -1013,15 +1211,17 @@ def mef_generate_report(
         return f"Error: 'formats' debe incluir al menos uno de: markdown, pdf, html.{extra}"
 
     try:
-        columns, rows, source_info = _run_read_query(query)
+        # Se pide una fila de más para poder decir que había continuación sin traerse el
+        # resto: un SELECT sin LIMIT sobre una tabla de millones de filas no cabe en RAM.
+        columns, rows, truncated, source_info = _run_read_query(
+            query, max_rows if max_rows > 0 else None
+        )
     except sqlite3.Error as e:
         return f"Error al ejecutar la consulta: {e}"
 
     if not rows:
         return "La consulta no retornó filas; no se generó ningún informe."
 
-    total_rows = len(rows)
-    shown = rows[:max_rows] if max_rows > 0 else rows
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     base = filename_base or title
     outputs = []
@@ -1029,85 +1229,110 @@ def mef_generate_report(
     try:
         if "markdown" in formats:
             path = _output_path(base, ".md")
-            content = _build_markdown_report(title, columns, shown, generated_at, source_info, total_rows)
+            content = _build_markdown_report(title, columns, rows, generated_at, source_info, truncated)
             Path(path).write_text(content, encoding="utf-8")
             outputs.append(path)
 
         if "html" in formats:
             path = _output_path(base, ".html")
-            content = _build_html_report(title, columns, shown, generated_at, source_info, total_rows)
+            content = _build_html_report(title, columns, rows, generated_at, source_info, truncated)
             Path(path).write_text(content, encoding="utf-8")
             outputs.append(path)
 
         if "pdf" in formats:
             path = _output_path(base, ".pdf")
-            _build_pdf_report(title, columns, shown, generated_at, source_info, path, total_rows)
+            _build_pdf_report(title, columns, rows, generated_at, source_info, path, truncated)
             outputs.append(path)
     except OSError as e:
         return f"Error al escribir el informe: {e}"
 
-    note = _truncate_note(total_rows, len(shown))
-    return f"Informe generado ({len(shown)} filas{note}):\n" + "\n".join(outputs)
+    note = " (la consulta devuelve más filas: sube max_rows si las necesitas)" if truncated else ""
+    return f"Informe generado ({len(rows)} filas{note}):\n" + "\n".join(outputs)
 
 
 def mef_export_csv(query: str, filename: str) -> str:
     if not _is_read_query(query):
         return "Error: mef_export_csv solo acepta consultas de lectura (SELECT / WITH)."
 
+    filepath = _output_path(filename, ".csv")
+    escritas = 0
     try:
-        columns, rows, _ = _run_read_query(query)
+        # Se escribe por lotes según llegan las filas: exportar un millón de filas con
+        # fetchall() pedía 1,2 GB de RAM, y aquí la memoria se mantiene plana.
+        with _stream_read_query(query) as (columns, filas):
+            with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(columns)
+                for fila in filas:
+                    writer.writerow(fila)
+                    escritas += 1
     except sqlite3.Error as e:
         return f"Error al ejecutar la consulta: {e}"
-
-    if not rows:
-        return "La consulta no retornó filas."
-
-    filepath = _output_path(filename, ".csv")
-    try:
-        # utf-8-sig para que Excel en Windows abra las tildes correctamente.
-        with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.writer(f)
-            writer.writerow(columns)
-            writer.writerows(rows)
     except OSError as e:
         return f"Error al escribir el CSV: {e}"
 
-    return f"Éxito. Datos exportados correctamente a {filepath} ({len(rows)} filas)."
+    if not escritas:
+        os.remove(filepath)
+        return "La consulta no retornó filas."
+    return f"Éxito. Datos exportados correctamente a {filepath} ({escritas} filas)."
 
 
 def mef_export_excel(query: str, filename: str = "") -> str:
     if not _is_read_query(query):
         return "Error: mef_export_excel solo acepta consultas de lectura (SELECT / WITH)."
 
+    path = _output_path(filename, ".xlsx")
+    escritas = 0
+    truncado = False
+
     try:
-        columns, rows, _ = _run_read_query(query)
+        with _stream_read_query(query) as (columns, filas):
+            if not columns:
+                return "La consulta no retornó columnas."
+
+            wb = Workbook(write_only=True)
+            ws = wb.create_sheet("Datos")
+
+            # El ancho se calcula con la primera muestra que llega: medir el texto de un
+            # millón de filas multiplicaría el tiempo sin cambiar el resultado visible.
+            muestra = []
+            for fila in filas:
+                muestra.append(fila)
+                if len(muestra) >= 500:
+                    break
+            for i, col in enumerate(columns, start=1):
+                ancho = max([len(str(col))] + [len(str(f[i - 1])) for f in muestra if f[i - 1] is not None])
+                ws.column_dimensions[get_column_letter(i)].width = min(ancho + 2, 50)
+
+            ws.freeze_panes = "A2"
+            cabecera = []
+            for col in columns:
+                celda = WriteOnlyCell(ws, value=col)
+                celda.font = Font(bold=True)
+                cabecera.append(celda)
+            ws.append(cabecera)
+
+            for fila in itertools.chain(muestra, filas):
+                if escritas >= EXCEL_MAX_ROWS:
+                    truncado = True
+                    break
+                ws.append(list(fila))
+                escritas += 1
     except sqlite3.Error as e:
         return f"Error al ejecutar la consulta: {e}"
 
-    if not rows:
+    if not escritas:
         return "La consulta no retornó filas."
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Datos"
-    ws.append(columns)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-    for row in rows:
-        ws.append(list(row))
-    ws.freeze_panes = "A2"
-
-    # El ancho se calcula sobre una muestra: recorrer 50k filas por columna sólo para medir
-    # texto multiplicaba el tiempo de exportación sin cambiar el resultado visible.
-    sample = rows[:500]
-    for i, col in enumerate(columns, start=1):
-        max_len = max([len(str(col))] + [len(str(r[i - 1])) for r in sample if r[i - 1] is not None])
-        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = min(max_len + 2, 50)
-
-    path = _output_path(filename, ".xlsx")
     try:
         wb.save(path)
     except OSError as e:
         return f"Error al escribir el Excel: {e}"
 
-    return f"Éxito. Datos exportados a {path} ({len(rows)} filas)."
+    aviso = ""
+    if truncado:
+        aviso = (
+            f" El formato .xlsx no admite más de {EXCEL_MAX_ROWS} filas de datos: el resto se "
+            "omitió (usa mef_export_csv para el volcado completo)."
+        )
+    return f"Éxito. Datos exportados a {path} ({escritas} filas).{aviso}"
