@@ -1,6 +1,17 @@
-
+# Datos e informes generados
 *.db
 *.db-journal
-.env
-__pycache__/
 output/
+.env
+
+# Entornos y artefactos de build
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Cachés
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/

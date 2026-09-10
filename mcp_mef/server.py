@@ -11,25 +11,62 @@ mcp = FastMCP("MEF_SIAF")
 
 
 @mcp.tool()
-async def fetch_mef_dataset(resource_id: str, table_name: str, limit: int = 1000, page_size: int = 1000) -> str:
+async def fetch_mef_dataset(
+    resource_id: str,
+    table_name: str,
+    limit: int = 1000,
+    page_size: int = 1000,
+    offset: int = 0,
+) -> str:
     """
-    Descarga un dataset del MEF usando su `resource_id` (obtenido desde datosabiertos.mef.gob.pe
-    o con mef_search_datasets) y lo guarda en la base de datos local (SQLite) bajo `table_name`.
-    Si la tabla ya existe, la sobrescribe.
+    Descarga un dataset del MEF usando su `resource_id` (obtenido con mef_search_datasets /
+    mef_list_resources) y lo guarda en la base de datos local (SQLite) bajo `table_name`.
+    Si la tabla ya existe, se reemplaza sólo cuando la descarga termina bien.
 
-    Pagina automáticamente la API hasta reunir `limit` registros (o hasta agotar el dataset),
-    en bloques de `page_size`. Para descargar un dataset completo, sube `limit` (ej. 50000).
-    Detecta automáticamente el tipo de cada columna (INTEGER/REAL/TEXT) y registra la
-    descarga en la tabla interna `_meta_downloads` para trazabilidad.
+    Pagina automáticamente hasta reunir `limit` registros (o agotar el dataset) en bloques de
+    `page_size` (máximo 20000, que es lo más eficiente), insertando cada página según llega.
+    `offset` permite empezar más adelante para traer un dataset grande por tramos.
+
+    IMPORTANTE: llama antes a mef_dataset_info(resource_id). Los datasets de Transparencia
+    Económica (Presupuesto y Ejecución de Gasto) tienen millones de filas y traerlos enteros
+    puede tardar horas; conviene acordar con el usuario un `limit` razonable.
+
+    Detecta el tipo de cada columna (INTEGER/REAL/TEXT) a partir de la primera página y
+    registra la descarga en la tabla interna `_meta_downloads` para trazabilidad.
     """
-    return await core.fetch_mef_dataset(resource_id, table_name, limit, page_size)
+    return await core.fetch_mef_dataset(resource_id, table_name, limit, page_size, offset)
 
 
 @mcp.tool()
-async def mef_search_datasets(query: str) -> str:
+async def mef_dataset_info(resource_id: str) -> str:
     """
-    Busca datasets dinámicamente en el portal de datos abiertos.
-    Retorna los títulos y los 'resource_id' listos para descargar.
+    Consulta cuántas filas y qué columnas tiene un recurso del MEF SIN descargarlo, con una
+    fila de muestra. Úsalo siempre antes de fetch_mef_dataset para dimensionar la descarga
+    (los datasets de gasto anual superan los 7 millones de filas y 60 columnas).
+    """
+    return await core.mef_dataset_info(resource_id)
+
+
+@mcp.tool()
+async def mef_list_resources(dataset_slug: str) -> str:
+    """
+    Lista todos los recursos descargables de un dataset del portal, con su `resource_id`.
+    El `dataset_slug` es el campo 'slug' que devuelve mef_search_datasets
+    (ej. 'presupuesto-y-ejecucion-de-gasto').
+
+    Es el paso obligado para los datos de Transparencia Económica: esos datasets publican un
+    recurso por año (2009-Gasto.csv ... 2026-Gasto-Mensual.csv) más un diccionario de
+    variables, cada uno con su propio resource_id.
+    """
+    return await core.mef_list_resources(dataset_slug)
+
+
+@mcp.tool()
+async def mef_search_datasets(query: str, page: int = 1) -> str:
+    """
+    Busca datasets dinámicamente en el portal de Datos Abiertos del MEF por palabra clave
+    (ej. 'canon minero') y retorna, en JSON, los títulos de los recursos tabulares encontrados
+    junto a su 'resource_id', listo para pasar a fetch_mef_dataset.
     """
     return await core.mef_search_datasets(query)
 
@@ -57,8 +94,10 @@ def mef_list_known_datasets() -> str:
 def sql_mef_db(query: str) -> str:
     """
     Ejecuta una consulta SQL nativa en la base de datos local del MEF (mef_data.db).
-    Puedes hacer JOINs entre tablas que hayas descargado previamente.
-    Retorna los resultados en formato JSON.
+    Puedes hacer JOINs entre tablas que hayas descargado previamente, y también CTEs
+    (`WITH ... SELECT`). Es la única tool que admite sentencias de escritura (CREATE/UPDATE/
+    DELETE sobre tablas derivadas); las de informe y exportación solo aceptan lectura.
+    Retorna los resultados en formato JSON: {"columnas": [...], "filas": [[...]]}.
     """
     return core.sql_mef_db(query)
 
@@ -99,30 +138,40 @@ def mef_generate_chart(query: str, chart_type: str, title: str) -> str:
 def mef_generate_chart_local(query: str, chart_type: str, title: str, filename: str = "") -> str:
     """
     Ejecuta una consulta SQL (debe retornar 2 columnas: etiqueta y valor numérico) y genera un
-    gráfico con matplotlib guardado como imagen PNG en la carpeta 'output/' del proyecto, sin
-    depender de ningún servicio externo. Ideal para incrustar en informes PDF/HTML offline.
+    gráfico con matplotlib guardado como imagen PNG en ~/.mcp-mef/output, sin depender de
+    ningún servicio externo. Ideal para incrustar en informes PDF/HTML offline.
     chart_type: 'bar', 'pie' o 'line'.
     """
     return core.mef_generate_chart_local(query, chart_type, title, filename)
 
 
 @mcp.tool()
-def mef_generate_report(query: str, title: str, formats: list[str] = ["markdown"], filename_base: str = "") -> str:
+def mef_generate_report(
+    query: str,
+    title: str,
+    formats: list[str] | None = None,
+    filename_base: str = "",
+    max_rows: int = core.MAX_REPORT_ROWS,
+) -> str:
     """
-    Ejecuta una consulta SQL SELECT sobre mef_data.db y genera un informe con los resultados
-    en uno o más formatos: 'markdown', 'pdf', 'html'. Guarda los archivos en la carpeta 'output/'
-    del proyecto. Cada informe incluye la fecha de generación y, si puede detectarse a partir de
-    la tabla usada en el FROM, la fuente/fecha de descarga registrada en `_meta_downloads`.
+    Ejecuta una consulta de lectura (SELECT o WITH) sobre mef_data.db y genera un informe con
+    los resultados en uno o más formatos: 'markdown', 'pdf', 'html' (por defecto, markdown).
+    Guarda los archivos en ~/.mcp-mef/output. Cada informe incluye la fecha de generación y, si
+    puede detectarse a partir de la tabla usada en el FROM, la fuente/fecha de descarga
+    registrada en `_meta_downloads`.
+    Como un informe con decenas de miles de filas es inmanejable (sobre todo en PDF), la tabla
+    se trunca a `max_rows` filas y el pie del informe indica el total real.
     Retorna las rutas de los archivos generados.
     """
-    return core.mef_generate_report(query, title, formats, filename_base)
+    return core.mef_generate_report(query, title, formats, filename_base, max_rows)
 
 
 @mcp.tool()
 def mef_export_csv(query: str, filename: str) -> str:
     """
-    Ejecuta una consulta SQL en la base de datos local y exporta los resultados a un archivo CSV
-    en la carpeta 'output/' del proyecto. filename debe terminar en .csv, por ejemplo 'reporte.csv'.
+    Ejecuta una consulta de lectura (SELECT o WITH) y exporta los resultados a un CSV en
+    ~/.mcp-mef/output. `filename` es solo un nombre de archivo (sin rutas); la extensión .csv
+    se añade si falta. El archivo se escribe con BOM UTF-8 para que Excel muestre bien las tildes.
     """
     return core.mef_export_csv(query, filename)
 
@@ -130,8 +179,9 @@ def mef_export_csv(query: str, filename: str) -> str:
 @mcp.tool()
 def mef_export_excel(query: str, filename: str = "") -> str:
     """
-    Ejecuta una consulta SQL SELECT y exporta el resultado a un archivo Excel (.xlsx) en la
-    carpeta 'output/' del proyecto, con encabezados en negrita y columnas autoajustadas.
+    Ejecuta una consulta de lectura (SELECT o WITH) y exporta el resultado a un archivo Excel
+    (.xlsx) en ~/.mcp-mef/output, con encabezados en negrita, fila de títulos congelada y
+    columnas autoajustadas.
     """
     return core.mef_export_excel(query, filename)
 

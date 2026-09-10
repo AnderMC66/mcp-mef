@@ -1,9 +1,11 @@
 [project]
 name = "mcp-mef"
-version = "0.2.0"
+dynamic = ["version"]
 description = "CLI y servidor MCP para los Datos Abiertos del MEF (Perú): descarga, consulta SQL e informes en Markdown/PDF/Excel."
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.14"
+keywords = ["mef", "peru", "datos-abiertos", "mcp", "sqlite", "cli"]
 dependencies = [
     "fpdf2>=2.8.7",
     "httpx>=0.28.1",
@@ -11,12 +13,31 @@ dependencies = [
     "matplotlib>=3.11.1",
     "mcp>=1.28.1",
     "openpyxl>=3.1.5",
+    "rich>=13.8",
     "typer>=0.15",
 ]
 
+[project.urls]
+Homepage = "https://github.com/rodrigocapiz67-tech/mcp-mef"
+Issues = "https://github.com/rodrigocapiz67-tech/mcp-mef/issues"
+
 [project.scripts]
 mef = "mcp_mef.cli:app"
+mef-mcp = "mcp_mef.server:run"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+# Fuente única de la versión: mcp_mef/__init__.py (evita que pyproject y el paquete se desincronicen).
+path = "mcp_mef/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_mef"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
