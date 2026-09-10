@@ -76,9 +76,18 @@ def mef_register_dataset_alias(alias: str, resource_id: str, description: str = 
     """
     Registra un alias memorable (ej. 'canon_minero_2025') que apunta a un `resource_id` ya
     verificado (obtenido previamente con mef_search_datasets), para no tener que volver a
-    buscarlo cada vez. Se guarda localmente en mef_data.db.
+    buscarlo cada vez. Se guarda localmente en mef_data.db, y a partir de entonces
+    fetch_mef_dataset y mef_dataset_info aceptan ese alias donde esperan un resource_id.
     """
     return core.mef_register_dataset_alias(alias, resource_id, description)
+
+
+@mcp.tool()
+def mef_remove_dataset_alias(alias: str) -> str:
+    """
+    Borra un alias del catálogo local. No afecta a las tablas ya descargadas.
+    """
+    return core.mef_remove_dataset_alias(alias)
 
 
 @mcp.tool()
@@ -91,15 +100,20 @@ def mef_list_known_datasets() -> str:
 
 
 @mcp.tool()
-def sql_mef_db(query: str) -> str:
+def sql_mef_db(query: str, max_rows: int = core.MAX_SQL_ROWS) -> str:
     """
     Ejecuta una consulta SQL nativa en la base de datos local del MEF (mef_data.db).
     Puedes hacer JOINs entre tablas que hayas descargado previamente, y también CTEs
     (`WITH ... SELECT`). Es la única tool que admite sentencias de escritura (CREATE/UPDATE/
     DELETE sobre tablas derivadas); las de informe y exportación solo aceptan lectura.
     Retorna los resultados en formato JSON: {"columnas": [...], "filas": [[...]]}.
+
+    Devuelve como mucho `max_rows` filas (1000 por defecto) y avisa con "truncado": true
+    cuando había más. Las tablas descargadas pueden tener millones de filas, así que agrega
+    siempre GROUP BY / LIMIT en vez de subir `max_rows`: para volcados completos existen
+    mef_export_csv y mef_export_excel.
     """
-    return core.sql_mef_db(query)
+    return core.sql_mef_db(query, max_rows)
 
 
 @mcp.tool()
@@ -110,6 +124,28 @@ def mef_get_schema() -> str:
     Útil para saber qué consultar con sql_mef_db o mef_generate_report.
     """
     return core.mef_get_schema()
+
+
+@mcp.tool()
+def mef_db_stats() -> str:
+    """
+    Cuánto ocupa en disco la base local, qué tablas contiene y cuántas filas tiene cada una.
+    Útil para decidir qué borrar cuando se han descargado varios años de datos de gasto.
+    """
+    return core.mef_db_stats()
+
+
+@mcp.tool()
+def mef_drop_table(table_name: str, vacuum: bool = False) -> str:
+    """
+    BORRA una tabla descargada y su registro de trazabilidad. Es destructivo e irreversible:
+    confirma con la persona usuaria antes de llamarlo, y recuérdale que volver a descargar el
+    dataset puede tardar mucho.
+
+    Con vacuum=True compacta además el archivo para devolver el espacio al sistema (puede
+    tardar en bases de varios GB).
+    """
+    return core.mef_drop_table(table_name, vacuum)
 
 
 @mcp.tool()
@@ -126,6 +162,7 @@ def mef_dataset_summary(table_name: str) -> str:
 def mef_generate_chart(query: str, chart_type: str, title: str) -> str:
     """
     Ejecuta una consulta SQL y genera un gráfico a través de QuickChart (servicio externo).
+    La consulta no debe devolver más de 2000 puntos: agrupa con GROUP BY antes de graficar.
     chart_type puede ser 'bar', 'pie', o 'line'.
     La consulta DEBE retornar 2 columnas: la primera para las etiquetas (labels) y la segunda para los valores numéricos.
     Retorna una URL directa a la imagen del gráfico. Requiere conexión a internet para visualizarla.
@@ -169,8 +206,8 @@ def mef_generate_report(
 @mcp.tool()
 def mef_export_csv(query: str, filename: str) -> str:
     """
-    Ejecuta una consulta de lectura (SELECT o WITH) y exporta los resultados a un CSV en
-    ~/.mcp-mef/output. `filename` es solo un nombre de archivo (sin rutas); la extensión .csv
+    Ejecuta una consulta de lectura (SELECT o WITH) y exporta TODOS los resultados a un CSV
+    en ~/.mcp-mef/output, escribiéndolos por lotes (sin tope de filas ni de memoria). `filename` es solo un nombre de archivo (sin rutas); la extensión .csv
     se añade si falta. El archivo se escribe con BOM UTF-8 para que Excel muestre bien las tildes.
     """
     return core.mef_export_csv(query, filename)
@@ -181,7 +218,8 @@ def mef_export_excel(query: str, filename: str = "") -> str:
     """
     Ejecuta una consulta de lectura (SELECT o WITH) y exporta el resultado a un archivo Excel
     (.xlsx) en ~/.mcp-mef/output, con encabezados en negrita, fila de títulos congelada y
-    columnas autoajustadas.
+    columnas autoajustadas. El formato .xlsx no admite más de 1 048 575 filas de datos; si la
+    consulta devuelve más, se avisa y conviene usar mef_export_csv.
     """
     return core.mef_export_excel(query, filename)
 

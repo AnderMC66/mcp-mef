@@ -159,9 +159,16 @@ def test_report_rechaza_escritura(poblada):
 def test_report_trunca_y_avisa(poblada):
     salida = core.mef_generate_report("SELECT * FROM canon", "Canon", ["markdown"], "trunc", max_rows=2)
     contenido = open(os.path.join(core.OUTPUT_DIR, "trunc.md"), encoding="utf-8").read()
+    assert "Filas mostradas: 2" in contenido
+    assert "la consulta devuelve más" in contenido
+    assert "2 filas" in salida and "devuelve más" in salida
+
+
+def test_report_completo_dice_el_total(poblada):
+    core.mef_generate_report("SELECT * FROM canon", "Canon", ["markdown"], "full")
+    contenido = open(os.path.join(core.OUTPUT_DIR, "full.md"), encoding="utf-8").read()
     assert "Total de filas: 4" in contenido
-    assert "primeras 2" in contenido
-    assert "primeras 2" in salida
+    assert "devuelve más" not in contenido
 
 
 def test_report_escapa_pipes_en_markdown(poblada):
