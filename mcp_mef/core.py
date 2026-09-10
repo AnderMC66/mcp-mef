@@ -577,6 +577,7 @@ async def fetch_mef_dataset(
     page_size: int = 1000,
     offset: int = 0,
     progress=None,
+    append: bool = False,
 ) -> str:
     """Descarga un dataset del MEF a SQLite, página a página.
 
@@ -585,6 +586,17 @@ async def fetch_mef_dataset(
     la tabla anterior sigue intacta y consultable hasta que la descarga termina bien.
     `resource_id` puede ser el UUID del recurso o un alias registrado en el catálogo.
     `progress`, si se pasa, se llama con (filas_descargadas, filas_totales_o_None).
+
+    Con `append=True` este lote se AGREGA a `table_name` en vez de reemplazarla, lo que
+    permite traer un dataset de millones de filas en varias llamadas sin que cada una borre
+    la anterior. Si además `offset` se deja en 0, se autodetecta como el nº de filas que la
+    tabla ya tiene, así que repetir el mismo comando exacto continúa donde se quedó:
+
+        mef fetch <id> gasto_2026 --append --limit 500000   # se repite hasta agotar el dataset
+
+    Cuando ya no quedan filas por traer, devuelve un aviso de que la descarga terminó (no un
+    error). Las columnas nuevas que aparezcan en un lote posterior se agregan a la tabla con
+    ALTER TABLE; las columnas que un lote no trae quedan NULL en esas filas.
     """
     try:
         _validate_table_name(table_name)
@@ -614,6 +626,32 @@ async def fetch_mef_dataset(
             conn.isolation_level = None
             cur = conn.cursor()
             cur.execute(f"DROP TABLE IF EXISTS {staging}")  # restos de una descarga anterior
+
+            existe_destino = bool(
+                cur.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (table_name,)
+                ).fetchone()
+            )
+            # offset=0 con append=True significa "continúa donde esta tabla se quedó": evita
+            # que el usuario tenga que llevar la cuenta de las filas a mano llamada tras llamada.
+            aviso_id = ""
+            if append and existe_destino:
+                if offset == 0:
+                    offset = cur.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0]
+                # Evita mezclar por error dos descargas distintas (p.ej. Gasto 2025 sobre
+                # Gasto 2026) en una misma tabla: se avisa, pero no se bloquea, porque la
+                # tabla también pudo crearse a mano con `mef sql`.
+                try:
+                    previo = cur.execute(
+                        "SELECT resource_id FROM _meta_downloads WHERE table_name = ?", (table_name,)
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    previo = None
+                if previo and previo[0] and previo[0] != resource_id:
+                    aviso_id = (
+                        f" (aviso: '{table_name}' se descargó antes desde resource_id "
+                        f"'{previo[0]}', distinto del actual '{resource_id}')"
+                    )
 
             try:
                 async with httpx.AsyncClient(
@@ -678,16 +716,37 @@ async def fetch_mef_dataset(
 
                 if not downloaded:
                     cur.execute(f"DROP TABLE IF EXISTS {staging}")
+                    if append and existe_destino:
+                        total_ya = cur.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0]
+                        return (
+                            f"Descarga completa: '{table_name}' ya tiene todas las filas "
+                            f"disponibles ({total_ya}). No quedaban registros nuevos en offset={offset}."
+                        )
                     return "No se encontraron registros o la API del MEF indicó error."
 
-                # Sustitución atómica: hasta este punto la tabla real conserva los datos previos.
                 cur.execute("BEGIN")
-                cur.execute(f"DROP TABLE IF EXISTS {quoted}")
-                cur.execute(f"ALTER TABLE {staging} RENAME TO {quoted}")
-                _register_download(cur, table_name, resource_id, downloaded)
+                if append and existe_destino:
+                    # Fusiona el esquema: columnas que la tabla real no tenía se agregan;
+                    # columnas que este lote no trae quedan NULL en las filas nuevas (el
+                    # INSERT con lista explícita de columnas ya lo hace por sí solo).
+                    existentes = {r[1] for r in cur.execute(f"PRAGMA table_info({quoted})")}
+                    for col in columns:
+                        if col not in existentes:
+                            cur.execute(f"ALTER TABLE {quoted} ADD COLUMN {_quote_ident(col)} {col_types[col]}")
+                    col_list = ", ".join(_quote_ident(c) for c in columns)
+                    cur.execute(f"INSERT INTO {quoted} ({col_list}) SELECT {col_list} FROM {staging}")
+                    cur.execute(f"DROP TABLE {staging}")
+                    total_registrado = cur.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0]
+                else:
+                    # Sustitución atómica: hasta este punto la tabla real (si existía) sigue intacta.
+                    cur.execute(f"DROP TABLE IF EXISTS {quoted}")
+                    cur.execute(f"ALTER TABLE {staging} RENAME TO {quoted}")
+                    total_registrado = downloaded
+                _register_download(cur, table_name, resource_id, total_registrado)
                 cur.execute("COMMIT")
             except Exception:
-                # La tabla previa no se tocó; sólo hay que limpiar el staging.
+                # La tabla real no se tocó (o sólo se le agregaron columnas, inofensivo);
+                # sólo hay que limpiar el staging.
                 try:
                     cur.execute("ROLLBACK")
                 except sqlite3.Error:
@@ -705,12 +764,14 @@ async def fetch_mef_dataset(
     restante = ""
     if total_api and offset + downloaded < total_api:
         pendientes = total_api - offset - downloaded
+        si_append = " (con --append para seguir agregando a la misma tabla)" if not append else ""
         restante = (
-            f"\nEl dataset tiene {total_api} filas en total: quedan {pendientes} sin descargar "
-            f"(sube el limit, o repite con offset={offset + downloaded} sobre otra tabla)."
+            f"\nEl dataset tiene {total_api} filas en total: quedan {pendientes} sin descargar. "
+            f"Repite el comando{si_append} para seguir, o sube --limit."
         )
+    resumen_tabla = f" ({total_registrado} en total en '{table_name}')" if append and existe_destino else ""
     return (
-        f"Éxito: se guardaron {downloaded} registros reales en la tabla '{table_name}'{warning}.\n"
+        f"Éxito: se guardaron {downloaded} registros nuevos{resumen_tabla}{warning}{aviso_id}.\n"
         f"Tipos detectados -> {tipos}{restante}"
     )
 

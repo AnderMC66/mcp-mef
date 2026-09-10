@@ -118,6 +118,20 @@ mef info d45f660d-6d14-438e-9d91-300084c9b85f       # 3. cuántas filas tiene (�
 mef fetch d45f660d-6d14-438e-9d91-300084c9b85f gasto_2026 --limit 50000 --page-size 20000
 ```
 
+Para traer el dataset **completo** (millones de filas) en vez de sólo un tramo, usa
+`--append` y repite el mismo comando: cada llamada agrega a la tabla y continúa
+automáticamente donde se quedó la anterior, hasta que avisa "Descarga completa":
+
+```bash
+mef fetch d45f660d-6d14-438e-9d91-300084c9b85f gasto_2026 --append --limit 500000 --page-size 20000
+mef fetch d45f660d-6d14-438e-9d91-300084c9b85f gasto_2026 --append --limit 500000 --page-size 20000
+# ... repetir hasta "Descarga completa: 'gasto_2026' ya tiene todas las filas disponibles"
+```
+
+Sin `--append`, cada `mef fetch` **reemplaza** la tabla entera (incluido `--offset` a mano:
+sirve para bajar tramos a tablas *distintas* que luego se unen con `UNION ALL`, no para
+completar una misma tabla).
+
 Datasets más usados (el `slug` va en `mef resources`):
 
 | Slug | Contenido |
@@ -131,8 +145,8 @@ Datasets más usados (el `slug` va en `mef resources`):
 Cosas a tener en cuenta, comprobadas contra la API:
 
 - **Tamaño.** Un año de gasto ronda los **7,7 millones de filas y 63 columnas** (el CSV
-  equivalente pesa ~4,6 GB). Baja tramos con `--limit`/`--offset` y filtra ya en SQL; el
-  mensaje final te dice cuántas filas quedaron sin traer.
+  equivalente pesa ~4,6 GB). Bájalo por tramos con `--append` (ver arriba) y filtra ya en
+  SQL; el mensaje final te dice cuántas filas quedaron sin traer.
 - **Velocidad.** `--page-size 20000` es el máximo y el más eficiente (~20 000 filas cada 7 s);
   con el valor por defecto de 1000 la misma descarga tarda el doble.
 - **No hay filtros del lado del servidor.** Los parámetros `filters`, `q` y `fields` de CKAN
@@ -169,7 +183,7 @@ El servidor MCP expone las siguientes herramientas (equivalentes 1 a 1 a los sub
 * `mef_search_datasets(query, page)`: Busca datasets en el portal por palabra clave y devuelve el `slug` de cada uno, sus formatos y una muestra de recursos. Si una frase no da resultados, reintenta con la palabra más significativa.
 * `mef_list_resources(dataset_slug)`: Lista todos los recursos de un dataset con su `resource_id` (los de Transparencia Económica publican uno por año).
 * `mef_dataset_info(resource_id)`: Cuántas filas y columnas tiene un recurso, con una fila de muestra, **sin descargarlo**. Conviene llamarlo antes de cualquier `fetch_mef_dataset`.
-* `fetch_mef_dataset(resource_id, table_name, limit, page_size, offset)`: Descarga un recurso del portal paginando hasta `limit` registros e insertando cada página en SQLite según llega (memoria constante). La tabla anterior se reemplaza sólo si la descarga termina bien.
+* `fetch_mef_dataset(resource_id, table_name, limit, page_size, offset, append)`: Descarga un recurso del portal paginando hasta `limit` registros e insertando cada página en SQLite según llega (memoria constante). Sin `append`, la tabla anterior se reemplaza sólo si la descarga termina bien; con `append=True` se agrega a la tabla existente y, si `offset` queda en 0, se autodetecta desde dónde continuar — así se completa un dataset de millones de filas en varias llamadas.
 * `mef_register_dataset_alias(alias, resource_id, description)`: Guarda un alias memorable hacia un `resource_id` ya verificado.
 * `mef_list_known_datasets()` / `mef_remove_dataset_alias(alias)`: Lista o borra los alias registrados.
 
@@ -204,7 +218,7 @@ Para cualquier otra tabla o consulta, usa `mef report` (CLI) o la tool `mef_gene
 
 ```bash
 uv sync --group dev     # instala dependencias + pytest
-uv run pytest -q        # 108 tests, sin tocar la red ni ~/.mcp-mef
+uv run pytest -q        # 115 tests, sin tocar la red ni ~/.mcp-mef
 ```
 
 Los tests usan un `MCP_MEF_HOME` temporal y un transporte HTTP simulado, así que no descargan

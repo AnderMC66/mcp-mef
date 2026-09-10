@@ -116,7 +116,7 @@ def test_fetch_avisa_de_lo_que_queda(db, monkeypatch):
     salida = asyncio.run(core.fetch_mef_dataset("res", "t", limit=2, page_size=2))
     assert "1000 filas en total" in salida
     assert "quedan 998" in salida
-    assert "offset=2" in salida
+    assert "--append" in salida
 
 
 def test_fetch_respeta_offset(db, monkeypatch):
@@ -171,3 +171,91 @@ def test_dataset_info_resource_id_malo(db, monkeypatch):
     _fake_client([[]], monkeypatch)
     assert "resource_id" in asyncio.run(core.mef_dataset_info("no-existe"))
 
+
+# --- Descarga incremental con --append -------------------------------------------
+
+def test_append_construye_el_dataset_completo_en_llamadas_sucesivas(db, monkeypatch):
+    """El caso que motiva --append: reconstruir 7,7M filas en tramos sobre UNA tabla."""
+    _fake_client([[{"a": "1"}, {"a": "2"}]], monkeypatch, total=6)
+    salida1 = asyncio.run(core.fetch_mef_dataset("res", "t", limit=2, page_size=2, append=True))
+    assert "2 registros nuevos" in salida1
+    assert json.loads(core.sql_mef_db("SELECT COUNT(*) n FROM t"))["filas"] == [[2]]
+
+    # Sin pasar offset: debe autodetectar que la tabla ya tiene 2 filas y seguir desde ahí.
+    _fake_client([[{"a": "3"}, {"a": "4"}]], monkeypatch, total=6)
+    salida2 = asyncio.run(core.fetch_mef_dataset("res", "t", limit=2, page_size=2, append=True))
+    assert "4 en total en 't'" in salida2
+    assert json.loads(core.sql_mef_db("SELECT a FROM t ORDER BY a"))["filas"] == [[1], [2], [3], [4]]
+
+    _fake_client([[{"a": "5"}, {"a": "6"}]], monkeypatch, total=6)
+    asyncio.run(core.fetch_mef_dataset("res", "t", limit=2, page_size=2, append=True))
+    assert json.loads(core.sql_mef_db("SELECT COUNT(*) n FROM t"))["filas"] == [[6]]
+
+    # Una llamada más allá del final: no debe fallar ni duplicar, sino avisar que terminó.
+    _fake_client([[]], monkeypatch, total=6)
+    salida4 = asyncio.run(core.fetch_mef_dataset("res", "t", limit=2, page_size=2, append=True))
+    assert "Descarga completa" in salida4
+    assert json.loads(core.sql_mef_db("SELECT COUNT(*) n FROM t"))["filas"] == [[6]]
+
+
+def test_append_sin_tabla_previa_se_comporta_como_fetch_normal(db, monkeypatch):
+    llamadas = _fake_client([[{"a": "1"}]], monkeypatch, total=1)
+    asyncio.run(core.fetch_mef_dataset("res", "t", limit=10, append=True))
+    assert llamadas[0].url.params["offset"] == "0"
+    assert json.loads(core.sql_mef_db("SELECT a FROM t"))["filas"] == [[1]]
+
+
+def test_append_respeta_un_offset_explicito(db, monkeypatch):
+    """Un offset explícito != 0 no debe ser pisado por el autodetectado."""
+    _fake_client([[{"a": "1"}]], monkeypatch)
+    asyncio.run(core.fetch_mef_dataset("res", "t", limit=1, append=True))
+
+    llamadas = _fake_client([[{"a": "99"}]], monkeypatch)
+    asyncio.run(core.fetch_mef_dataset("res", "t", limit=1, offset=500, append=True))
+    assert llamadas[0].url.params["offset"] == "500"
+
+
+def test_append_fusiona_columnas_nuevas(db, monkeypatch):
+    """Una columna que aparece recién en un lote posterior no debe romper el merge."""
+    _fake_client([[{"a": "1"}]], monkeypatch)
+    asyncio.run(core.fetch_mef_dataset("res", "t", limit=1, append=True))
+
+    _fake_client([[{"a": "2", "b": "nuevo"}]], monkeypatch)
+    asyncio.run(core.fetch_mef_dataset("res", "t", limit=1, offset=1, append=True))
+
+    payload = json.loads(core.sql_mef_db("SELECT a, b FROM t ORDER BY a"))
+    assert payload["filas"] == [[1, None], [2, "nuevo"]]
+
+
+def test_append_no_deja_tabla_de_staging(db, monkeypatch):
+    _fake_client([[{"a": "1"}]], monkeypatch)
+    asyncio.run(core.fetch_mef_dataset("res", "t", limit=1, append=True))
+    _fake_client([[{"a": "2"}]], monkeypatch)
+    asyncio.run(core.fetch_mef_dataset("res", "t", limit=1, offset=1, append=True))
+    with core._db() as conn:
+        tablas = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    assert not any(t.startswith(core.STAGING_PREFIX) for t in tablas)
+
+
+def test_append_avisa_si_el_resource_id_cambio(db, monkeypatch):
+    """Evita mezclar por error dos datasets distintos (p.ej. Gasto 2025 y 2026) en una tabla."""
+    _fake_client([[{"a": "1"}]], monkeypatch)
+    asyncio.run(core.fetch_mef_dataset("res-2025", "t", limit=1, append=True))
+
+    _fake_client([[{"a": "2"}]], monkeypatch)
+    salida = asyncio.run(core.fetch_mef_dataset("res-2026", "t", limit=1, offset=1, append=True))
+    assert "distinto del actual" in salida
+    assert "res-2025" in salida
+
+
+def test_append_sin_registrar_descarga_previa_no_falla(db, monkeypatch):
+    """Una tabla creada a mano con `mef sql` no tiene fila en _meta_downloads: no debe reventar."""
+    with core._db() as conn:
+        conn.execute("CREATE TABLE t (a INTEGER)")
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.commit()
+
+    _fake_client([[{"a": "2"}]], monkeypatch)
+    salida = asyncio.run(core.fetch_mef_dataset("res", "t", limit=1, append=True))
+    assert "2 en total en 't'" in salida
+    assert "distinto del actual" not in salida
