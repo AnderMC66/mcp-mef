@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # El proyecto se usa sobre todo en Windows (Claude Desktop), pero el manejo de rutas
+        # y de la base SQLite tiene que seguir funcionando en Linux.
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --group dev
+      - run: uv run pytest -q
