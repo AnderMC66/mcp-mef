@@ -11,7 +11,10 @@ dependencies = [
     "httpx>=0.28.1",
     "jinja2>=3.1.6",
     "matplotlib>=3.11.1",
-    "mcp>=1.28.1",
+    # mcp 2.x renombró FastMCP a MCPServer y cambió su API (sin shim de compatibilidad):
+    # server.py usa mcp.server.fastmcp.FastMCP (API de la serie 1.x). Sin este tope, una
+    # instalación nueva resuelve mcp 2.x y el servidor MCP no arranca.
+    "mcp>=1.28.1,<2",
     "openpyxl>=3.1.5",
     "rich>=13.8",
     "typer>=0.15",
