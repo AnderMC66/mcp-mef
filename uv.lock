@@ -519,7 +519,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "matplotlib", specifier = ">=3.11.1" },
-    { name = "mcp", specifier = ">=1.28.1" },
+    { name = "mcp", specifier = ">=1.28.1,<2" },
     { name = "openpyxl", specifier = ">=3.1.5" },
     { name = "rich", specifier = ">=13.8" },
     { name = "typer", specifier = ">=0.15" },
