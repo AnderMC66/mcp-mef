@@ -40,12 +40,13 @@ def _emit(result: str) -> None:
 
 _CAPABILITIES = [
     ("Búsqueda", "Encuentra datasets del MEF por palabra clave y lista sus recursos por año."),
-    ("Transparencia", "Alcanza los datos de Consulta Amigable: presupuesto y ejecución de gasto."),
+    ("Consulta Amigable", "Extrae datos en tiempo real por ministerio y fechas (apps5.mineco.gob.pe)."),
+    ("Búsqueda Vectorial / FTS5", "Búsqueda semántica con similitud coseno y texto completo BM25."),
     ("Descarga por streaming", "Pagina la API e inserta según llega: soporta datasets de millones de filas."),
     ("SQL local", "Motor SQLite embebido: joins, agrupaciones y análisis sobre lo descargado."),
     ("EDA", "Resumen exploratorio de cualquier tabla: nulos, distintos, min/max/promedio."),
     ("Catálogo", "Alias reutilizables hacia resource_id ya verificados."),
-    ("Informes", "Markdown, PDF, HTML y Excel a partir de cualquier consulta SQL."),
+    ("Informes y Excel", "Markdown, PDF, HTML y Excel (.xlsx) estilizado a partir de cualquier consulta."),
     ("Gráficos", "Vía QuickChart (online) o localmente con matplotlib (PNG offline)."),
 ]
 
@@ -326,10 +327,135 @@ def drop(
     _emit(core.mef_drop_table(table_name, vacuum))
 
 
+@app.command("amigable", rich_help_panel="Consulta y Exploración")
+def amigable_cmd(
+    anio: int = typer.Option(2024, "--anio", "-y", help="Año fiscal (ej. 2024, 2025, 2026)."),
+    ministerio: str = typer.Option("", "--ministerio", "-m", help="Ministerio o sector (ej. SALUD, EDUCACION, 11, MTC)."),
+    mes: int = typer.Option(None, "--mes", help="Mes de ejecución (1 a 12)."),
+    excel: bool = typer.Option(False, "--excel", help="Exporta directamente a Excel (.xlsx)."),
+    filename: str = typer.Option("", "--filename", help="Nombre personalizado para el archivo Excel."),
+    tipo: str = typer.Option("mensual", "--tipo", "-t", help="Tipo de consulta: 'mensual' o 'diaria'."),
+):
+    """Consulta en tiempo real el portal oficial de Consulta Amigable (apps5.mineco.gob.pe)."""
+    from . import consulta_amigable
+
+    async def _run():
+        return await consulta_amigable.consultar_amigable(
+            anio=anio,
+            ministerio=ministerio,
+            mes=mes,
+            export_excel=excel,
+            nombre_excel=filename,
+            tipo=tipo,
+        )
+
+    res = asyncio.run(_run())
+    if "error" in res:
+        console.print(f"[red]{res['error']}[/red]")
+        raise typer.Exit(code=1)
+
+    datos = res.get("datos", [])
+    sub_info = f" · Corte: {res.get('fecha_actualizacion')}" if res.get('fecha_actualizacion') else ""
+    table = Table(title=f"MEF Consulta Amigable ({res.get('modulo', 'mensual')}) · {res.get('ministerio')} ({res.get('anio')}){sub_info}", box=box.ROUNDED)
+    table.add_column("Descripción", style="cyan", no_wrap=False)
+    table.add_column("PIM (S/)", justify="right")
+    table.add_column("Devengado (S/)", justify="right", style="green")
+    table.add_column("Girado (S/)", justify="right")
+    table.add_column("% Avance", justify="right", style="bold yellow")
+
+    for d in datos[:30]:
+        pim = f"{d.get('pim', 0):,.2f}" if d.get('pim') is not None else "-"
+        dev = f"{d.get('devengado', 0):,.2f}" if d.get('devengado') is not None else "-"
+        gir = f"{d.get('girado', 0):,.2f}" if d.get('girado') is not None else "-"
+        av = f"{d.get('avance_porcentaje', 0):.1f}%" if d.get('avance_porcentaje') is not None else "-"
+        table.add_row(d.get("descripcion", ""), pim, dev, gir, av)
+
+    console.print(table)
+    if len(datos) > 30:
+        console.print(f"[dim]Mostrando 30 de {len(datos)} registros.[/dim]")
+    if "archivo_excel" in res:
+        console.print(f"[bold green]Excel generado:[/bold green] {res['archivo_excel']}")
+
+
+@app.command("pliegos", rich_help_panel="Consulta y Exploración")
+def pliegos_cmd(
+    ministerio: str = typer.Argument(..., help="Ministerio o sector (ej. SALUD, EDUCACION, 11)."),
+    anio: int = typer.Option(2024, "--anio", "-y", help="Año fiscal (ej. 2024, 2025)."),
+    excel: bool = typer.Option(False, "--excel", help="Exporta directamente a Excel (.xlsx)."),
+    filename: str = typer.Option("", "--filename", help="Nombre del archivo Excel."),
+):
+    """Lista los pliegos y organismos de un ministerio en tiempo real desde Consulta Amigable."""
+    from . import consulta_amigable
+
+    async def _run():
+        return await consulta_amigable.consultar_amigable_pliegos(
+            anio=anio,
+            ministerio=ministerio,
+            export_excel=excel,
+            nombre_excel=filename,
+        )
+
+    res = asyncio.run(_run())
+    if "error" in res:
+        console.print(f"[red]{res['error']}[/red]")
+        raise typer.Exit(code=1)
+
+    pliegos = res.get("pliegos", [])
+    table = Table(title=f"Pliegos Ejecutores · {res.get('sector')} ({res.get('anio')})", box=box.ROUNDED)
+    table.add_column("Pliego", style="cyan")
+    table.add_column("PIM (S/)", justify="right")
+    table.add_column("Devengado (S/)", justify="right", style="green")
+    table.add_column("% Avance", justify="right", style="bold yellow")
+
+    for p in pliegos:
+        pim = f"{p.get('pim', 0):,.2f}" if p.get('pim') is not None else "-"
+        dev = f"{p.get('devengado', 0):,.2f}" if p.get('devengado') is not None else "-"
+        av = f"{p.get('avance_porcentaje', 0):.1f}%" if p.get('avance_porcentaje') is not None else "-"
+        table.add_row(p.get("descripcion", ""), pim, dev, av)
+
+    console.print(table)
+    if "archivo_excel" in res:
+        console.print(f"[bold green]Excel generado:[/bold green] {res['archivo_excel']}")
+
+
+@app.command("fts", rich_help_panel="Consulta y Exploración")
+def fts_search_cmd(
+    query: str = typer.Argument(..., help="Texto o palabras a buscar (ej. 'hospital huancavelica')."),
+    table: str = typer.Argument(..., help="Tabla donde buscar (ej. gasto_2026)."),
+    limit: int = typer.Option(20, "--limit", "-l", help="Máximo número de coincidencias."),
+):
+    """Búsqueda rápida de texto completo con SQLite FTS5 y ponderación BM25."""
+    from . import search as search_mod
+
+    _emit(search_mod.mef_fts_search(query=query, table_name=table, limit=limit))
+
+
+@app.command("vector", rich_help_panel="Consulta y Exploración")
+def vector_search_cmd(
+    query: str = typer.Argument(..., help="Texto o concepto a buscar semánticamente."),
+    table: str = typer.Argument(..., help="Tabla donde buscar (ej. gasto_2026)."),
+    field: str = typer.Option("", "--field", "-f", help="Columna textual a vectorizar."),
+    top_k: int = typer.Option(10, "--top-k", "-k", help="Cantidad de resultados más similares."),
+):
+    """Búsqueda por similitud vectorial y semántica (embeddings n-gram + coseno con numpy)."""
+    from . import search as search_mod
+
+    _emit(search_mod.mef_vector_search(query=query, table_name=table, field=field, top_k=top_k))
+
+
+@app.command("index", rich_help_panel="Consulta y Exploración")
+def create_index_cmd(
+    table: str = typer.Argument(..., help="Tabla a indexar."),
+):
+    """Crea un índice FTS5 sobre las columnas textuales de una tabla para búsqueda ultrarrápida."""
+    from . import search as search_mod
+
+    _emit(search_mod.mef_create_search_index(table_name=table))
+
+
 @app.command("mcp", rich_help_panel="Búsqueda y Descarga")
 def mcp_serve():
     """Arranca el servidor MCP por stdio (para Claude Desktop y otros clientes MCP)."""
-    # Import diferido: arrancar el CLI no debería pagar el coste de cargar el SDK de MCP.
     from .server import run
 
     run()

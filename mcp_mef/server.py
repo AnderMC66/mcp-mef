@@ -6,6 +6,9 @@ para que ambos compartan comportamiento y datos.
 from mcp.server.fastmcp import FastMCP
 
 from . import core
+from . import consulta_amigable
+from . import search
+import json
 
 mcp = FastMCP("MEF_SIAF")
 
@@ -232,6 +235,103 @@ def mef_export_excel(query: str, filename: str = "") -> str:
     consulta devuelve más, se avisa y conviene usar mef_export_csv.
     """
     return core.mef_export_excel(query, filename)
+
+
+@mcp.tool()
+async def mef_consulta_amigable(
+    anio: int = 2024,
+    ministerio: str = "",
+    mes: int | None = None,
+    nivel_gobierno: str = "E",
+    export_excel: bool = False,
+    nombre_excel: str = "",
+    tipo: str = "mensual",
+) -> str:
+    """
+    Extrae datos en tiempo real del portal web oficial de Consulta Amigable (apps5.mineco.gob.pe).
+    
+    Permite consultar la ejecución presupuestal por:
+    - `anio`: Año presupuestal (ej. 2024, 2025, 2026).
+    - `ministerio`: Nombre o código del sector (ej. 'SALUD', 'EDUCACION', '11', '36: TRANSPORTES', 'PCM', 'MININTER', etc.). Si se deja vacío, extrae todos los sectores/ministerios.
+    - `mes`: Mes específico de ejecución (1: Enero ... 12: Diciembre). Si se define, desglosa las cifras de ejecución por mes (Certificación, Compromiso, Devengado, Girado).
+    - `nivel_gobierno`: 'E' (Gobierno Nacional / Ministerios), 'R' (Gobiernos Regionales), 'M' (Gobiernos Locales).
+    - `export_excel`: Si es True, genera y exporta automáticamente los resultados a un archivo Excel (.xlsx) estilizado en ~/.mcp-mef/output.
+    - `tipo`: 'mensual' (corte consolidado mensual) o 'diaria' (seguimiento diario actualizado cada noche con el último día hábil).
+    """
+    res = await consulta_amigable.consultar_amigable(
+        anio=anio,
+        ministerio=ministerio,
+        mes=mes,
+        nivel_gobierno=nivel_gobierno,
+        export_excel=export_excel,
+        nombre_excel=nombre_excel,
+        tipo=tipo,
+    )
+    return json.dumps(res, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def mef_consulta_amigable_pliegos(
+    anio: int = 2024,
+    ministerio: str = "SALUD",
+    export_excel: bool = False,
+    nombre_excel: str = "",
+    tipo: str = "mensual",
+) -> str:
+    """
+    Extrae la lista de pliegos y organismos ejecutores dentro de un ministerio en tiempo real
+    desde el portal de Consulta Amigable (apps5.mineco.gob.pe), mostrando su PIA, PIM,
+    Certificación, Compromiso Anual, Devengado, Girado y % de Avance.
+    
+    - `anio`: Año fiscal (ej. 2024, 2025, 2026).
+    - `ministerio`: Nombre o código del ministerio (ej. 'SALUD', 'EDUCACION', 'TRANSPORTES', '11', '10', etc.).
+    - `export_excel`: Si es True, genera un archivo Excel (.xlsx) con el desglose de los pliegos.
+    - `tipo`: 'mensual' o 'diaria'.
+    """
+    res = await consulta_amigable.consultar_amigable_pliegos(
+        anio=anio,
+        ministerio=ministerio,
+        export_excel=export_excel,
+        nombre_excel=nombre_excel,
+        tipo=tipo,
+    )
+    return json.dumps(res, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def mef_fts_search(query: str, table_name: str, limit: int = 20) -> str:
+    """
+    Busca proyectos, obras, actividades, clasificadores o pliegos en una tabla descargada
+    usando SQLite FTS5 (Full-Text Search) con ranking por algoritmo BM25.
+    
+    Es ultrarrápido y permite búsquedas como 'hospital huancavelica', 'puente carrozable',
+    'instituto superior', clasificando los resultados por relevancia. Si el índice FTS5 no
+    existe aún, lo construye automáticamente sobre la marcha.
+    """
+    return search.mef_fts_search(query=query, table_name=table_name, limit=limit)
+
+
+@mcp.tool()
+def mef_vector_search(query: str, table_name: str, field: str = "", top_k: int = 10) -> str:
+    """
+    Realiza una búsqueda semántica y por similitud vectorial con embeddings n-gram y similitud
+    coseno (vía numpy) sobre una columna de texto en mef_data.db.
+    
+    A diferencia de la búsqueda exacta, la similitud vectorial encuentra coincidencias conceptuales,
+    morfológicas o con variaciones tipográficas (por ejemplo, buscar 'infraestructura medica'
+    encuentra 'CONSTRUCCION DEL CENTRO DE SALUD...').
+    """
+    return search.mef_vector_search(query=query, table_name=table_name, field=field, top_k=top_k)
+
+
+@mcp.tool()
+def mef_create_search_index(table_name: str, fields: list[str] | None = None) -> str:
+    """
+    Crea o reconstruye un índice de búsqueda rápida de texto completo (FTS5) sobre las
+    columnas principales de una tabla descargada (por ejemplo, nombres de proyectos, obras,
+    pliegos, funciones y clasificadores de gasto).
+    """
+    return search.mef_create_search_index(table_name=table_name, fields=fields)
 
 
 def run():

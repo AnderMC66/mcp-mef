@@ -89,6 +89,7 @@ _READ_ONLY_ACTIONS = frozenset({
     sqlite3.SQLITE_READ,
     sqlite3.SQLITE_FUNCTION,
     sqlite3.SQLITE_RECURSIVE,
+    sqlite3.SQLITE_PRAGMA,
 })
 
 
